@@ -25,7 +25,8 @@ fn main() -> eframe::Result {
             viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
             ..Default::default()
         },
-        Box::new(|_| {
+        Box::new(|cc| {
+            setup_style(&cc.egui_ctx);
             let mut app = App::default();
             let days = app.journal.settings.retention_days;
             match app.journal.purge(days) {
@@ -38,11 +39,69 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Larger, consistent text and roomier spacing for both light and dark themes.
+fn setup_style(ctx: &egui::Context) {
+    use egui::{FontFamily::*, FontId, TextStyle};
+    ctx.all_styles_mut(|s| {
+        s.text_styles = [
+            (TextStyle::Heading, FontId::new(22.0, Proportional)),
+            (TextStyle::Body, FontId::new(16.0, Proportional)),
+            (TextStyle::Button, FontId::new(16.0, Proportional)),
+            (TextStyle::Monospace, FontId::new(15.0, Monospace)),
+            (TextStyle::Small, FontId::new(13.5, Proportional)),
+        ]
+        .into();
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(8.0, 4.0);
+        s.spacing.interact_size.y = 26.0;
+        s.spacing.icon_width = 18.0; // checkbox / radio box, scaled with the text
+        s.spacing.icon_width_inner = 10.0;
+    });
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Dirs,
+    Home,
     System,
     TwoDirs,
+}
+
+impl Mode {
+    const ALL: [Mode; 4] = [Mode::Dirs, Mode::Home, Mode::TwoDirs, Mode::System];
+
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Dirs => "Selected directories",
+            Mode::Home => "User directory",
+            Mode::TwoDirs => "Compare two directories",
+            Mode::System => "Whole system",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Mode::Dirs => "Find duplicates inside one or more folders",
+            Mode::Home => "Scan your home folder, skipping caches and app data",
+            Mode::TwoDirs => "Compare folder A with folder B; enables the A ⇄ B sync tab",
+            Mode::System => "Scan the whole disk from the filesystem root",
+        }
+    }
+
+    /// Default Exclude string for this mode (path substrings, ;-separated).
+    fn excludes(self) -> String {
+        const DEV: &str = "/.git/;node_modules;/target/debug/;/target/release/;/__pycache__/;/.venv/";
+        match self {
+            Mode::System => SYSTEM_EXCLUDES.join(";") + ";" + DEV,
+            // ponytail: Linux/macOS cache paths; add Windows AppData ones if Windows users scan homes.
+            Mode::Home => format!("/.cache/;/.local/share/Trash/;/snap/;/.cargo/registry/;/.rustup/;/.npm/;/.var/app/;/.mozilla/;/.config/google-chrome/;/Library/Caches/;{DEV}"),
+            Mode::Dirs | Mode::TwoDirs => DEV.into(),
+        }
+    }
+}
+
+fn home() -> PathBuf {
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -141,7 +200,7 @@ impl Default for App {
             roots: vec![],
             crit: Criteria::default(),
             min_kib: 1,
-            exclude: SYSTEM_EXCLUDES.join(";") + ";/.git/;node_modules",
+            exclude: Mode::Dirs.excludes(),
             hidden: false,
             top_n: 200,
             find_dirs: true,
@@ -182,6 +241,7 @@ impl App {
     fn scan_opts(&self) -> ScanOpts {
         let roots = match self.mode {
             Mode::System => vec![PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" })],
+            Mode::Home => vec![home()],
             _ => self.roots.clone(),
         };
         ScanOpts {
@@ -342,17 +402,13 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Scan");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), egui::widgets::global_theme_preference_buttons);
-        });
-        egui::CollapsingHeader::new("Where").default_open(true).show(ui, |ui| self.sidebar_where(ui));
+        ui.heading("Scan");
         egui::CollapsingHeader::new("What to find").default_open(true).show(ui, |ui| self.sidebar_what(ui));
         ui.separator();
         let any_crit = self.crit.name || self.crit.size || self.crit.mtime || self.crit.content;
         let ready = any_crit
             && match self.mode {
-                Mode::System => true,
+                Mode::System | Mode::Home => true,
                 Mode::Dirs => !self.roots.is_empty(),
                 Mode::TwoDirs => self.roots.len() == 2,
             };
@@ -366,10 +422,15 @@ impl App {
             if total > 0 {
                 ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{done} / {total}")));
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button("Cancel").on_hover_text("Stop the scan; partial results are discarded").clicked() {
                 p.cancel.store(true, Ordering::Relaxed);
             }
-        } else if ui.add_enabled(ready, egui::Button::new(RichText::new("🔍 Scan").heading())).clicked() {
+        } else if ui
+            .add_enabled(ready, egui::Button::new(RichText::new("🔍 Scan").heading()))
+            .on_hover_text("Scan the folders above with the options below")
+            .on_disabled_hover_text("Pick folders in the top bar and at least one match criterion")
+            .clicked()
+        {
             self.start_scan();
         }
         ui.separator();
@@ -377,69 +438,124 @@ impl App {
         egui::CollapsingHeader::new("Safety").show(ui, |ui| self.sidebar_safety(ui));
     }
 
-    fn sidebar_where(&mut self, ui: &mut egui::Ui) {
-        ui.radio_value(&mut self.mode, Mode::Dirs, "Selected directories");
-        ui.radio_value(&mut self.mode, Mode::TwoDirs, "Compare two directories");
-        ui.radio_value(&mut self.mode, Mode::System, "Whole system");
-        if self.mode != Mode::System {
-            let mut rm = None;
-            for (i, r) in self.roots.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.small_button("✖").clicked() {
-                        rm = Some(i);
+    /// Full-width top bar: scan mode, hidden files, theme / folders / excludes.
+    fn where_bar(&mut self, ui: &mut egui::Ui) {
+        let h = ui.spacing().interact_size.y;
+        // Fixed-width, left-aligned row caption so all rows line up.
+        let caption = |ui: &mut egui::Ui, t: &str| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(80.0, h), egui::Sense::hover());
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            ui.painter().text(r.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER, t, font, ui.visuals().strong_text_color());
+        };
+        ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            caption(ui, "Where");
+            egui::ComboBox::from_id_salt("mode")
+                .selected_text(self.mode.name())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for m in Mode::ALL {
+                        if ui.selectable_value(&mut self.mode, m, m.name()).on_hover_text(m.tip()).changed() {
+                            self.exclude = m.excludes();
+                        }
                     }
-                    let tag = if self.mode == Mode::TwoDirs { ["A: ", "B: "].get(i).copied().unwrap_or("") } else { "" };
-                    ui.label(format!("{tag}{}", r.display()));
-                });
+                })
+                .response
+                .on_hover_text("What to scan. Picking an option also fills Exclude with its presets");
+            let mut skip = !self.hidden;
+            if ui.checkbox(&mut skip, "Skip hidden files").on_hover_text("Ignore dot-files and dot-folders").changed() {
+                self.hidden = !skip;
             }
-            if let Some(i) = rm {
-                self.roots.remove(i);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), egui::widgets::global_theme_preference_buttons);
+        });
+        ui.horizontal_wrapped(|ui| {
+            caption(ui, "Folders");
+            match self.mode {
+                Mode::System | Mode::Home => {
+                    let root = self.scan_opts().roots.remove(0);
+                    ui.add_sized([0.0, h], egui::Label::new(format!("📁 {}", root.display())));
+                }
+                Mode::Dirs | Mode::TwoDirs => {
+                    let mut rm = None;
+                    for (i, r) in self.roots.iter().enumerate() {
+                        let tag = if self.mode == Mode::TwoDirs { ["A: ", "B: "].get(i).copied().unwrap_or("") } else { "" };
+                        // Folder "chip": same height as the buttons around it.
+                        egui::Frame::new()
+                            .fill(ui.visuals().faint_bg_color)
+                            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                            .corner_radius(4)
+                            .inner_margin(egui::Margin::symmetric(8, 0))
+                            .show(ui, |ui| {
+                                ui.set_min_height(h);
+                                ui.label(format!("📁 {tag}{}", r.display()));
+                                if ui.add(egui::Button::new("✖").frame(false)).on_hover_text("Remove this folder").clicked() {
+                                    rm = Some(i);
+                                }
+                            });
+                    }
+                    if let Some(i) = rm {
+                        self.roots.remove(i);
+                    }
+                    if ui.button("➕ Add folder…").on_hover_text("Add a folder to scan").clicked()
+                        && let Some(p) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.roots.push(p);
+                    }
+                    if self.mode == Mode::TwoDirs && self.roots.len() != 2 {
+                        ui.colored_label(Self::warn(ui), "Pick exactly 2 folders (A, B)");
+                    }
+                }
             }
-            if ui.button("➕ Add folder…").clicked()
-                && let Some(p) = rfd::FileDialog::new().pick_folder()
-            {
-                self.roots.push(p);
+        });
+        ui.horizontal(|ui| {
+            caption(ui, "Exclude");
+            if ui.button("↺").on_hover_text("Reset to the presets for the selected mode").clicked() {
+                self.exclude = self.mode.excludes();
             }
-            if self.mode == Mode::TwoDirs && self.roots.len() != 2 {
-                ui.colored_label(Self::warn(ui), "Pick exactly 2 folders (A, B)");
-            }
-        }
-        ui.checkbox(&mut self.hidden, "Include hidden files");
-        ui.label("Exclude (path substrings, ;-separated):");
-        ui.text_edit_multiline(&mut self.exclude);
+            ui.add(egui::TextEdit::singleline(&mut self.exclude).desired_width(f32::INFINITY))
+                .on_hover_text("Skip paths containing any of these substrings, separated by ;");
+        });
+        ui.add_space(10.0);
     }
 
     fn sidebar_what(&mut self, ui: &mut egui::Ui) {
         ui.label("Duplicates match on:");
-        ui.checkbox(&mut self.crit.name, "Name");
-        ui.checkbox(&mut self.crit.size, "Size");
-        ui.checkbox(&mut self.crit.mtime, "Modified date");
-        ui.checkbox(&mut self.crit.content, "Content (BLAKE3 hash)");
+        ui.checkbox(&mut self.crit.name, "Name").on_hover_text("Same file name");
+        ui.checkbox(&mut self.crit.size, "Size").on_hover_text("Same size in bytes");
+        ui.checkbox(&mut self.crit.mtime, "Modified date").on_hover_text("Same last-modified time");
+        ui.checkbox(&mut self.crit.content, "Content (BLAKE3 hash)")
+            .on_hover_text("Identical bytes. Slowest but the only safe choice before deleting; results are cached");
         ui.label("Also find:");
-        ui.checkbox(&mut self.find_dirs, "Duplicate folders");
+        ui.checkbox(&mut self.find_dirs, "Duplicate folders").on_hover_text("Folders whose whole contents match another folder");
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.find_images, "Similar images, distance");
-            ui.add(egui::DragValue::new(&mut self.img_dist).range(0..=20));
+            ui.checkbox(&mut self.find_images, "Similar images, distance").on_hover_text("Visually similar pictures (resized, recompressed…)");
+            ui.add(egui::DragValue::new(&mut self.img_dist).range(0..=20)).on_hover_text("Max perceptual-hash difference: 0 = near identical, higher = looser");
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.find_audio, "Similar music (tags), ±s");
-            ui.add(egui::DragValue::new(&mut self.audio_tol).range(0..=30));
+            ui.checkbox(&mut self.find_audio, "Similar music (tags), ±s").on_hover_text("Tracks with the same artist and title tags");
+            ui.add(egui::DragValue::new(&mut self.audio_tol).range(0..=30)).on_hover_text("Allowed duration difference in seconds");
         });
         ui.horizontal(|ui| {
             ui.label("Min size KiB");
-            ui.add(egui::DragValue::new(&mut self.min_kib));
+            ui.add(egui::DragValue::new(&mut self.min_kib)).on_hover_text("Ignore files smaller than this");
             ui.label("Largest: top");
-            ui.add(egui::DragValue::new(&mut self.top_n).range(1..=100_000));
+            ui.add(egui::DragValue::new(&mut self.top_n).range(1..=100_000)).on_hover_text("How many files to list in Disk usage → Largest files");
         });
     }
 
     fn sidebar_schedule(&mut self, ui: &mut egui::Ui, ready: bool) {
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("freq").selected_text(self.sched_freq).width(70.0).show_ui(ui, |ui| {
-                for f in ["hourly", "daily", "weekly"] {
-                    ui.selectable_value(&mut self.sched_freq, f, f);
-                }
-            });
+            egui::ComboBox::from_id_salt("freq")
+                .selected_text(self.sched_freq)
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for f in ["hourly", "daily", "weekly"] {
+                        ui.selectable_value(&mut self.sched_freq, f, f);
+                    }
+                })
+                .response
+                .on_hover_text("How often the scheduled scan runs");
             if ui
                 .add_enabled(ready, egui::Button::new("⏰ Schedule"))
                 .on_hover_text("Run this scan periodically in the background; open results with Load report")
@@ -448,11 +564,11 @@ impl App {
                 let a = cli::to_args(&self.scan_opts(), self.crit, self.mode == Mode::TwoDirs);
                 self.log.push(cli::schedule(self.sched_freq, &a).unwrap_or_else(|e| e));
             }
-            if ui.small_button("Unschedule").clicked() {
+            if ui.small_button("Unschedule").on_hover_text("Remove the scheduled background scan").clicked() {
                 self.log.push(cli::unschedule().unwrap_or_else(|e| e));
             }
         });
-        if ui.button("📂 Load report…").clicked()
+        if ui.button("📂 Load report…").on_hover_text("Open results saved by a scheduled scan").clicked()
             && let Some(p) = rfd::FileDialog::new().set_directory(cli::reports_dir()).add_filter("report", &["json"]).pick_file()
         {
             match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str::<Report>(&s).map_err(|e| e.to_string())) {
@@ -471,7 +587,7 @@ impl App {
         let mut rm = None;
         for (i, r) in self.journal.settings.protected.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.small_button("✖").clicked() {
+                if ui.small_button("✖").on_hover_text("Stop protecting this folder").clicked() {
                     rm = Some(i);
                 }
                 ui.label(format!("🔒 {}", r.display()));
@@ -482,13 +598,13 @@ impl App {
             self.journal.settings.protected.remove(i);
             changed = true;
         }
-        if ui.button("➕ Protect folder…").clicked()
+        if ui.button("➕ Protect folder…").on_hover_text("Files in protected folders are never selected or removed").clicked()
             && let Some(p) = rfd::FileDialog::new().pick_folder()
         {
             self.journal.settings.protected.push(p);
             changed = true;
         }
-        changed |= ui.checkbox(&mut self.journal.settings.verify_bytes, "Byte-by-byte verify before removing").changed();
+        changed |= ui.checkbox(&mut self.journal.settings.verify_bytes, "Byte-by-byte verify before removing").on_hover_text("Compare full contents again right before removing, in case files changed since the scan").changed();
         if changed {
             self.save_settings();
         }
@@ -499,10 +615,10 @@ impl App {
     fn log_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let arrow = if self.log_open { "▾ Log" } else { "▸ Log" };
-            if ui.selectable_label(self.log_open, format!("{arrow} ({})", self.log.len())).clicked() {
+            if ui.selectable_label(self.log_open, format!("{arrow} ({})", self.log.len())).on_hover_text("Show or hide the full log").clicked() {
                 self.log_open = !self.log_open;
             }
-            if ui.small_button("clear").clicked() {
+            if ui.small_button("clear").on_hover_text("Clear the log").clicked() {
                 self.log.clear();
             }
             if !self.log_open
@@ -552,30 +668,49 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Select");
             ui.label("Filter:");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(160.0).hint_text("path contains…"));
+            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(160.0).hint_text("path contains…"))
+                .on_hover_text("Show only groups with a file whose path contains this text");
             ui.label("Sort:");
-            egui::ComboBox::from_id_salt("sort").selected_text(format!("{:?}", self.sort)).show_ui(ui, |ui| {
-                for s in [Sort::Wasted, Sort::Size, Sort::Count, Sort::Path] {
-                    ui.selectable_value(&mut self.sort, s, format!("{s:?}"));
-                }
-            });
+            egui::ComboBox::from_id_salt("sort")
+                .selected_text(format!("{:?}", self.sort))
+                .show_ui(ui, |ui| {
+                    for (s, tip) in [
+                        (Sort::Wasted, "Most reclaimable space first"),
+                        (Sort::Size, "Biggest files first"),
+                        (Sort::Count, "Most copies first"),
+                        (Sort::Path, "Alphabetical by path"),
+                    ] {
+                        ui.selectable_value(&mut self.sort, s, format!("{s:?}")).on_hover_text(tip);
+                    }
+                })
+                .response
+                .on_hover_text("Order of the groups below");
             ui.separator();
             ui.label("Auto-select, keep:");
-            egui::ComboBox::from_id_salt("keep").selected_text(format!("{:?}", self.keep)).show_ui(ui, |ui| {
-                for k in [KeepRule::Oldest, KeepRule::Newest, KeepRule::ShortestPath, KeepRule::FirstRoot] {
-                    ui.selectable_value(&mut self.keep, k, format!("{k:?}"));
-                }
-            });
-            if ui.button("Apply rule").clicked() {
+            egui::ComboBox::from_id_salt("keep")
+                .selected_text(format!("{:?}", self.keep))
+                .show_ui(ui, |ui| {
+                    for (k, tip) in [
+                        (KeepRule::Oldest, "Keep the copy with the oldest modified date"),
+                        (KeepRule::Newest, "Keep the copy with the newest modified date"),
+                        (KeepRule::ShortestPath, "Keep the copy with the shortest path"),
+                        (KeepRule::FirstRoot, "Keep the copy in the first scanned folder"),
+                    ] {
+                        ui.selectable_value(&mut self.keep, k, format!("{k:?}")).on_hover_text(tip);
+                    }
+                })
+                .response
+                .on_hover_text("Which copy Apply rule keeps in each group");
+            if ui.button("Apply rule").on_hover_text("In each group, select every copy except the one the rule keeps (protected files are never selected)").clicked() {
                 self.sel.extend(auto_select(groups, self.keep, &self.journal.settings.protected));
             }
-            if ui.button("Clear").clicked() {
+            if ui.button("Clear").on_hover_text("Deselect everything").clicked() {
                 self.sel.clear();
             }
-            if ui.button("Collapse all").clicked() {
+            if ui.button("Collapse all").on_hover_text("Fold all groups").clicked() {
                 self.collapsed.extend((0..groups.len()).map(|gi| (tab as u8, gi)));
             }
-            if ui.button("Expand all").clicked() {
+            if ui.button("Expand all").on_hover_text("Unfold all groups").clicked() {
                 self.collapsed.retain(|(t, _)| *t != tab as u8);
             }
         });
@@ -589,17 +724,29 @@ impl App {
             if !actions.contains(&self.action) {
                 self.action = Action::Trash;
             }
-            egui::ComboBox::from_id_salt("action").selected_text(format!("{:?}", self.action)).show_ui(ui, |ui| {
-                for &a in actions {
-                    let r = ui.selectable_value(&mut self.action, a, format!("{a:?}"));
-                    match a {
-                        Action::Hardlink => r.on_hover_text("All copies become one file: they share the kept copy's permissions, owner and modified date, and editing one edits all."),
-                        Action::Reflink => r.on_hover_text("Copy-on-write clone: keeps permissions and modified date, but the owner becomes you."),
-                        _ => r,
-                    };
-                }
-            });
-            if ui.add_enabled(sel_n > 0, egui::Button::new("Run on selected…")).clicked() {
+            egui::ComboBox::from_id_salt("action")
+                .selected_text(format!("{:?}", self.action))
+                .show_ui(ui, |ui| {
+                    for &a in actions {
+                        let r = ui.selectable_value(&mut self.action, a, format!("{a:?}"));
+                        r.on_hover_text(match a {
+                            Action::Trash => "Move selected files to the system trash",
+                            Action::Delete => "Delete selected files (quarantined instead if Quarantine is on)",
+                            Action::Hardlink => "All copies become one file: they share the kept copy's permissions, owner and modified date, and editing one edits all.",
+                            Action::Reflink => "Copy-on-write clone: keeps permissions and modified date, but the owner becomes you.",
+                            Action::MoveTo => "Move selected files to a folder you choose",
+                            _ => "",
+                        });
+                    }
+                })
+                .response
+                .on_hover_text("What to do with the selected files");
+            if ui
+                .add_enabled(sel_n > 0, egui::Button::new("Run on selected…"))
+                .on_hover_text("Review and confirm the action on the selected files")
+                .on_disabled_hover_text("Select some files first")
+                .clicked()
+            {
                 self.confirm = Some(tab);
             }
             let st = &mut self.journal.settings;
@@ -614,7 +761,7 @@ impl App {
             if changed && let Err(e) = self.journal.save() {
                 self.log.push(format!("settings: {e}"));
             }
-            if ui.button("Export CSV…").clicked()
+            if ui.button("Export CSV…").on_hover_text("Save all groups in this tab as a CSV file").clicked()
                 && let Some(p) = rfd::FileDialog::new().set_file_name("duplicates.csv").save_file()
                 && let Err(e) = std::fs::write(&p, to_csv(groups))
             {
@@ -652,10 +799,10 @@ impl App {
                             let key = (tab as u8, gi);
                             let open_now = !self.collapsed.contains(&key);
                             let head = format!("{} {} × {} — {} wasted", if open_now { "▾" } else { "▸" }, g.len(), human(g[0].size), human(wasted(g)));
-                            if ui.selectable_label(false, RichText::new(head).strong()).clicked() {
+                            if ui.selectable_label(false, RichText::new(head).strong()).on_hover_text("Click to fold or unfold this group").clicked() {
                                 if open_now { self.collapsed.insert(key) } else { self.collapsed.remove(&key) };
                             }
-                            if tab == Tab::Dups && g[0].size < 50 << 20 && is_text(&g[0].path) && ui.small_button("Compare / merge first two").clicked() {
+                            if tab == Tab::Dups && g[0].size < 50 << 20 && is_text(&g[0].path) && ui.small_button("Compare / merge first two").on_hover_text("Open the first two files in the Text compare / merge tab").clicked() {
                                 open = Some((g[0].path.clone(), g[1].path.clone()));
                             }
                         }
@@ -787,7 +934,7 @@ impl App {
     fn history_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(format!("Quarantine: {} · data dir {}", human(self.journal.quarantine_bytes()), self.journal.dir.display()));
-            if ui.button("Empty quarantine…").clicked() {
+            if ui.button("Empty quarantine…").on_hover_text("Permanently delete everything in quarantine and the backups").clicked() {
                 self.confirm_purge = true;
             }
         });
@@ -864,8 +1011,8 @@ impl App {
             return;
         };
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.treemap, true, "Treemap");
-            ui.selectable_value(&mut self.treemap, false, "Largest files");
+            ui.selectable_value(&mut self.treemap, true, "Treemap").on_hover_text("Map of disk usage by folder");
+            ui.selectable_value(&mut self.treemap, false, "Largest files").on_hover_text("Biggest files, largest first");
         });
         if self.treemap {
             match &res.tree {
@@ -885,7 +1032,7 @@ impl App {
         egui::ScrollArea::vertical().id_salt("largest").auto_shrink(false).show_rows(ui, row_h, res.largest.len(), |ui, range| {
             for f in &res.largest[range] {
                 ui.horizontal(|ui| {
-                    if ui.small_button("🗑 Trash").clicked() {
+                    if ui.small_button("🗑 Trash").on_hover_text("Move to the system trash (undo in History)").clicked() {
                         trashed.push(f.clone());
                     }
                     ui.add_sized([80.0, row_h], egui::Label::new(human(f.size)));
@@ -946,22 +1093,22 @@ impl App {
         ui.label(format!("A = {}   B = {}", res.roots[0].display(), res.roots[1].display()));
         ui.horizontal_wrapped(|ui| {
             for (i, s) in SYNC_STATES.iter().enumerate() {
-                ui.checkbox(&mut self.sync_show[i], format!("{s:?} ({})", count(*s)));
+                ui.checkbox(&mut self.sync_show[i], format!("{s:?} ({})", count(*s))).on_hover_text("Show rows in this state");
             }
         });
         let mut copy: Option<bool> = None; // Some(true) = A→B
         ui.horizontal(|ui| {
-            if ui.button("Select all missing/newer").clicked() {
+            if ui.button("Select all missing/newer").on_hover_text("Select files that exist on only one side or are newer on one side").clicked() {
                 self.sync_sel = res.sync.iter().filter(|r| !matches!(r.state, sync::State::Same | sync::State::Differ)).map(|r| r.rel.clone()).collect();
             }
-            if ui.button("Clear").clicked() {
+            if ui.button("Clear").on_hover_text("Deselect everything").clicked() {
                 self.sync_sel.clear();
             }
             ui.separator();
             if ui.button("Copy selected A → B").on_hover_text("Rows that exist in A. Overwritten files are backed up; undo in History.").clicked() {
                 copy = Some(true);
             }
-            if ui.button("Copy selected B → A").clicked() {
+            if ui.button("Copy selected B → A").on_hover_text("Rows that exist in B. Overwritten files are backed up; undo in History.").clicked() {
                 copy = Some(false);
             }
         });
@@ -1002,7 +1149,7 @@ impl App {
                         && r.state != sync::State::Same
                         && a.size < 50 << 20
                         && is_text(&a.path)
-                        && ui.small_button("diff/merge").clicked()
+                        && ui.small_button("diff/merge").on_hover_text("Compare the A and B versions in the Text compare / merge tab").clicked()
                     {
                         open = Some((a.path.clone(), b.path.clone()));
                     }
@@ -1048,7 +1195,7 @@ impl App {
 
     fn merge_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Pick two text files…").clicked()
+            if ui.button("Pick two text files…").on_hover_text("Choose a left and a right file to compare").clicked()
                 && let Some(l) = rfd::FileDialog::new().set_title("Left file").pick_file()
                 && let Some(r) = rfd::FileDialog::new().set_title("Right file").pick_file()
             {
@@ -1075,23 +1222,23 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("All conflicts:");
             for (p, t) in [(Pick::Left, "Accept left"), (Pick::Right, "Accept right"), (Pick::LeftThenRight, "Both L+R")] {
-                if ui.button(t).clicked() {
+                if ui.button(t).on_hover_text("Apply this choice to every conflicting hunk").clicked() {
                     ms.m.pick_all(p);
                     ms.edited = None;
                 }
             }
             ui.separator();
-            if ui.button("💾 Save to left").clicked() {
+            if ui.button("💾 Save to left").on_hover_text("Overwrite the left file with the result (undo in History)").clicked() {
                 save = Some(ms.left.clone());
             }
-            if ui.button("💾 Save to right").clicked() {
+            if ui.button("💾 Save to right").on_hover_text("Overwrite the right file with the result (undo in History)").clicked() {
                 save = Some(ms.right.clone());
             }
-            if ui.button("💾 Save as…").clicked() {
+            if ui.button("💾 Save as…").on_hover_text("Write the result to a new file").clicked() {
                 save = rfd::FileDialog::new().save_file();
             }
             let mut manual = ms.edited.is_some();
-            if ui.checkbox(&mut manual, "Hand-edit result").changed() {
+            if ui.checkbox(&mut manual, "Hand-edit result").on_hover_text("Edit the merged text by hand; hunk choices stop applying").changed() {
                 ms.edited = manual.then(|| ms.m.result());
             }
         });
@@ -1147,17 +1294,28 @@ impl App {
                                 });
                                 ln_l += left.len();
                                 ln_r += right.len();
+                                let mut opts = vec![
+                                    (Pick::Left, "Left", "Use the left version"),
+                                    (Pick::Right, "Right", "Use the right version"),
+                                    (Pick::LeftThenRight, "Left + Right", "Keep both: left lines first"),
+                                    (Pick::RightThenLeft, "Right + Left", "Keep both: right lines first"),
+                                ];
+                                if three {
+                                    opts.push((Pick::Base, "Base", "Keep the common ancestor's lines"));
+                                }
+                                opts.push((Pick::Neither, "None", "Drop this hunk from the result"));
+                                let cur = opts.iter().find(|o| o.0 == *pick).map_or("?", |o| o.1);
                                 ui.horizontal(|ui| {
-                                    ui.push_id(i, |ui| {
-                                        let mut opts = vec![(Pick::Left, "L"), (Pick::Right, "R"), (Pick::LeftThenRight, "L+R"), (Pick::RightThenLeft, "R+L")];
-                                        if three {
-                                            opts.push((Pick::Base, "base"));
-                                        }
-                                        opts.push((Pick::Neither, "none"));
-                                        for (p, t) in opts {
-                                            ui.radio_value(pick, p, t);
-                                        }
-                                    });
+                                    ui.label("Use:");
+                                    egui::ComboBox::from_id_salt(("pick", i))
+                                        .selected_text(cur)
+                                        .show_ui(ui, |ui| {
+                                            for (p, t, tip) in opts {
+                                                ui.selectable_value(pick, p, t).on_hover_text(tip);
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text("Which version of this hunk goes into the result");
                                 });
                             });
                         }
@@ -1183,7 +1341,7 @@ fn treemap_view(ui: &mut egui::Ui, t: &tree::Tree, cur: usize) -> Option<usize> 
     let cur = cur.min(t.nodes.len() - 1);
     let mut next = None;
     ui.horizontal(|ui| {
-        if ui.add_enabled(t.nodes[cur].parent.is_some(), egui::Button::new("⬆ Up")).clicked() {
+        if ui.add_enabled(t.nodes[cur].parent.is_some(), egui::Button::new("⬆ Up")).on_hover_text("Go to the parent folder").clicked() {
             next = t.nodes[cur].parent;
         }
         ui.label(format!("{} — {}", if cur == 0 { "all roots".into() } else { t.path(cur).display().to_string() }, human(t.nodes[cur].size)));
@@ -1228,13 +1386,13 @@ fn draw_level(painter: &egui::Painter, t: &tree::Tree, node: usize, r: egui::Rec
         }
         painter.rect_filled(rr.shrink(0.5), 2.0, col);
         let label = |txt: String| {
-            painter.with_clip_rect(rr).text(rr.min + egui::vec2(3.0, 1.0), egui::Align2::LEFT_TOP, txt, egui::FontId::proportional(11.0), Color32::BLACK)
+            painter.with_clip_rect(rr).text(rr.min + egui::vec2(3.0, 1.0), egui::Align2::LEFT_TOP, txt, egui::FontId::proportional(13.0), Color32::BLACK)
         };
-        let inner = egui::Rect::from_min_max(rr.min + egui::vec2(3.0, 15.0), rr.max - egui::vec2(3.0, 3.0));
-        if n.dir && depth + 1 < TM_DEPTH && !n.children.is_empty() && inner.width() > 24.0 && inner.height() > 16.0 {
+        let inner = egui::Rect::from_min_max(rr.min + egui::vec2(3.0, 18.0), rr.max - egui::vec2(3.0, 3.0));
+        if n.dir && depth + 1 < TM_DEPTH && !n.children.is_empty() && inner.width() > 24.0 && inner.height() > 18.0 {
             label(format!("{}/  {}", n.name.to_string_lossy(), human(n.size)));
             draw_level(painter, t, k, inner, depth + 1, hover, hovered);
-        } else if rr.width() > 50.0 && rr.height() > 14.0 {
+        } else if rr.width() > 50.0 && rr.height() > 32.0 {
             label(format!("{}{}\n{}", n.name.to_string_lossy(), if n.dir { "/" } else { "" }, human(n.size)));
         }
     }
@@ -1259,7 +1417,9 @@ impl eframe::App for App {
         }
         self.confirm_dialog(&ctx);
         self.purge_dialog(&ctx);
-        egui::Panel::left("side").default_size(330.0).show(ui, |ui| {
+        // Added before the side panel so it spans the full window width.
+        egui::Panel::top("where").show(ui, |ui| self.where_bar(ui));
+        egui::Panel::left("side").default_size(370.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
         });
         egui::Panel::bottom("log").show(ui, |ui| self.log_bar(ui));
@@ -1277,7 +1437,17 @@ impl eframe::App for App {
             ];
             ui.horizontal_wrapped(|ui| {
                 for (t, label) in tabs {
-                    ui.selectable_value(&mut self.tab, t, label);
+                    let tip = match t {
+                        Tab::Dups => "Groups of duplicate files",
+                        Tab::Folders => "Folders with identical contents",
+                        Tab::Images => "Visually similar images",
+                        Tab::Audio => "Same song in several files",
+                        Tab::Largest => "Treemap and largest files",
+                        Tab::Sync => "Differences between folders A and B",
+                        Tab::Merge => "Compare and merge two text files",
+                        Tab::History => "Past actions; undo them here",
+                    };
+                    ui.selectable_value(&mut self.tab, t, label).on_hover_text(tip);
                 }
             });
             ui.separator();
