@@ -42,7 +42,7 @@ pub struct Progress {
     pub cancel: AtomicBool,
 }
 
-pub const PHASES: [&str; 5] = ["Walking", "Folders", "Images", "Music", "Hashing"];
+pub const PHASES: [&str; 6] = ["Walking", "Folders", "Images", "Music", "Hashing", "Clutter"];
 
 impl Progress {
     pub fn set_phase(&self, i: u8) {
@@ -73,6 +73,9 @@ pub struct Report {
     pub secs: f32,
     pub groups: Vec<Group>,
     pub largest: Vec<FileEntry>,
+    /// Empty with `--clutter` off, and in reports written before clutter existed.
+    #[serde(default)]
+    pub clutter: Vec<crate::junk::Item>,
 }
 
 /// Default excludes for whole-system scans: pseudo-filesystems that are huge or infinite.
@@ -86,15 +89,7 @@ pub fn collect(opts: &ScanOpts, prog: &Progress) -> Vec<FileEntry> {
     let data = crate::undo::data_dir();
     for (ri, root) in opts.roots.iter().enumerate() {
         let walker = walkdir::WalkDir::new(root).follow_links(false);
-        let it = walker.into_iter().filter_entry(|e| {
-            let p = e.path().to_string_lossy();
-            let hidden = e.depth() > 0 && e.file_name().to_string_lossy().starts_with('.');
-            // Never scan our own quarantine/backups: they'd show up as duplicates.
-            e.file_name() != crate::undo::QUARANTINE_NAME
-                && !e.path().starts_with(&data)
-                && (opts.follow_hidden || !hidden)
-                && !opts.exclude.iter().any(|x| !x.is_empty() && p.contains(x.as_str()))
-        });
+        let it = walker.into_iter().filter_entry(|e| wanted(e, opts, &data));
         for e in it.flatten() {
             if prog.cancel.load(Ordering::Relaxed) {
                 return out;
@@ -125,6 +120,37 @@ pub fn collect(opts: &ScanOpts, prog: &Progress) -> Vec<FileEntry> {
         }
     }
     out
+}
+
+/// Walk filter shared by every scan: hidden/excluded paths and our own data dir are skipped.
+pub fn wanted(e: &walkdir::DirEntry, opts: &ScanOpts, data: &Path) -> bool {
+    let p = e.path().to_string_lossy();
+    let hidden = e.depth() > 0 && e.file_name().to_string_lossy().starts_with('.');
+    // Never scan our own quarantine/backups: they'd show up as duplicates.
+    e.file_name() != crate::undo::QUARANTINE_NAME
+        && !e.path().starts_with(data)
+        && (opts.follow_hidden || !hidden)
+        && !opts.exclude.iter().any(|x| !x.is_empty() && p.contains(x.as_str()))
+}
+
+/// Stable id of a group = its set of paths. A new or removed copy changes it, so an ignored
+/// group resurfaces when its files change.
+pub fn group_key(g: &Group) -> String {
+    let mut p: Vec<&Path> = g.iter().map(|f| f.path.as_path()).collect();
+    p.sort();
+    let mut h = blake3::Hasher::new();
+    for x in p {
+        h.update(x.as_os_str().as_encoded_bytes());
+        h.update(b"\0");
+    }
+    hex(*h.finalize().as_bytes())
+}
+
+/// Drop groups the user chose to ignore.
+pub fn drop_ignored(groups: &mut Vec<Group>, ignored: &[String]) {
+    if !ignored.is_empty() {
+        groups.retain(|g| !ignored.contains(&group_key(g)));
+    }
 }
 
 pub fn largest(files: &[FileEntry], n: usize) -> Vec<FileEntry> {
@@ -416,6 +442,8 @@ pub struct ApplyOpts {
     pub protected: Vec<PathBuf>,
     /// Compare bytes with the kept copy instead of trusting BLAKE3 alone.
     pub verify_bytes: bool,
+    /// Items stand alone (clutter): no kept copy is needed, so Delete is not refused.
+    pub no_keep: bool,
 }
 
 /// Apply action to selected files. Kept copy per group = first unselected file.
@@ -430,10 +458,11 @@ pub fn apply(groups: &[Group], sel: &HashSet<PathBuf>, o: &ApplyOpts) -> (Vec<cr
     let doomed = doomed(groups, sel);
     for g in groups {
         // Kept copy must survive the whole run, not sit inside a folder removed by another group.
-        let Some(keep) = g.iter().find(|f| !removed(&f.path, &doomed)) else {
+        let keep = g.iter().find(|f| !removed(&f.path, &doomed));
+        if keep.is_none() && !o.no_keep {
             errs.push(format!("skipped group (all copies selected): {}", g[0].path.display()));
             continue;
-        };
+        }
         let keep_hash = OnceCell::new();
         for f in g.iter().filter(|f| sel.contains(&f.path)) {
             let r = (|| -> Result<crate::undo::Entry, String> {
@@ -442,28 +471,33 @@ pub fn apply(groups: &[Group], sel: &HashSet<PathBuf>, o: &ApplyOpts) -> (Vec<cr
                 }
                 let md = std::fs::symlink_metadata(&f.path).map_err(|e| e.to_string())?;
                 let (hash, same) = if md.is_dir() {
-                    if !matches!(action, Action::Trash | Action::Quarantine | Action::MoveTo) {
+                    if !matches!(action, Action::Trash | Action::Quarantine | Action::MoveTo) && !(o.no_keep && action == Action::Delete) {
                         return Err(format!("{action:?} not supported for folders"));
                     }
                     (None, false)
+                } else if md.is_symlink() {
+                    (None, false)
                 } else {
                     let h = hash_full(&f.path).map_err(|e| e.to_string())?;
-                    let kh = keep_hash.get_or_init(|| hash_full(&keep.path).ok());
-                    let same = *kh == Some(h) && (!o.verify_bytes || files_equal(&f.path, &keep.path).unwrap_or(false));
+                    let kh = keep_hash.get_or_init(|| keep.and_then(|k| hash_full(&k.path).ok()));
+                    let same = *kh == Some(h) && (!o.verify_bytes || keep.is_some_and(|k| files_equal(&f.path, &k.path).unwrap_or(false)));
                     (Some(hex(h)), same)
                 };
                 if matches!(action, Action::Hardlink | Action::Reflink) && !same {
                     return Err("content differs from kept copy; refusing to link".into());
                 }
-                if action == Action::Delete && !md.is_dir() && !same {
+                if action == Action::Delete && !md.is_dir() && !same && !o.no_keep {
                     return Err("content differs from kept copy; refusing permanent delete (use Trash or Quarantine)".into());
                 }
+                // `same` implies a kept copy exists; only links need it.
+                let keep_path = || &keep.expect("same => kept copy").path;
                 let stash = match action {
                     Action::Trash => crate::undo::trash_file(&f.path)?,
+                    Action::Delete if md.is_dir() => remove_empty_tree(&f.path).map(|_| None).map_err(|e| e.to_string())?,
                     Action::Delete => std::fs::remove_file(&f.path).map(|_| None).map_err(|e| e.to_string())?,
-                    Action::Hardlink => replace_with(&f.path, |tmp| std::fs::hard_link(&keep.path, tmp)).map(|_| None).map_err(|e| e.to_string())?,
+                    Action::Hardlink => replace_with(&f.path, |tmp| std::fs::hard_link(keep_path(), tmp)).map(|_| None).map_err(|e| e.to_string())?,
                     Action::Reflink => replace_with(&f.path, |tmp| {
-                        reflink_copy::reflink(&keep.path, tmp)?;
+                        reflink_copy::reflink(keep_path(), tmp)?;
                         std::fs::set_permissions(tmp, md.permissions())?;
                         std::fs::File::options().write(true).open(tmp)?.set_modified(md.modified()?)
                     })
@@ -488,7 +522,7 @@ pub fn apply(groups: &[Group], sel: &HashSet<PathBuf>, o: &ApplyOpts) -> (Vec<cr
                     time: SystemTime::now(),
                     action,
                     orig: f.path.clone(),
-                    keep: same.then(|| keep.path.clone()),
+                    keep: keep.filter(|_| same).map(|k| k.path.clone()),
                     hash,
                     size: f.size,
                     mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
@@ -507,6 +541,19 @@ pub fn apply(groups: &[Group], sel: &HashSet<PathBuf>, o: &ApplyOpts) -> (Vec<cr
 }
 
 use std::cell::OnceCell;
+
+/// Delete a folder that holds only empty folders. Any file inside (e.g. one created since the
+/// scan) makes it fail, so this can never take data with it.
+fn remove_empty_tree(p: &Path) -> std::io::Result<()> {
+    for e in walkdir::WalkDir::new(p).follow_links(false).contents_first(true) {
+        let e = e?;
+        if !e.file_type().is_dir() {
+            return Err(std::io::Error::other(format!("not empty: {}", e.path().display())));
+        }
+        std::fs::remove_dir(e.path())?;
+    }
+    Ok(())
+}
 
 /// Build replacement at a temp name, then atomic rename: `dup` is never missing.
 fn replace_with(dup: &Path, make: impl FnOnce(&Path) -> std::io::Result<()>) -> std::io::Result<()> {

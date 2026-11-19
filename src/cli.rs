@@ -12,6 +12,7 @@ usage:
                                              data dir and can be opened in the GUI
   tidytwin unschedule
   tidytwin undo-last                          undo the most recent action batch
+  tidytwin --version
 
 options:
   --match LIST     comma list of name,size,mtime,content   (default size,content)
@@ -23,6 +24,9 @@ options:
   --format F       json | csv                              (default json)
   --out FILE       write report to FILE instead of stdout
   --report         write report into <data dir>/reports/
+  --clutter        also find empty folders/files, temp files, broken symlinks,
+                   rebuildable build/cache folders, misnamed images, bad names
+  --broken         with --clutter: also open every image/music file to find broken ones (slow)
 ";
 
 pub fn reports_dir() -> PathBuf {
@@ -31,6 +35,7 @@ pub fn reports_dir() -> PathBuf {
 
 pub fn run(args: &[String]) -> i32 {
     let r = match args.first().map(String::as_str) {
+        Some("--version" | "-V") => Ok(println!("tidytwin {}", env!("CARGO_PKG_VERSION"))),
         Some("scan") => scan(&args[1..]),
         Some("schedule") => args.get(1).ok_or("missing frequency".to_string()).and_then(|f| schedule(f, &args[2..])).map(|m| println!("{m}")),
         Some("unschedule") => unschedule().map(|m| println!("{m}")),
@@ -54,6 +59,8 @@ struct Args {
     csv: bool,
     out: Option<PathBuf>,
     report: bool,
+    clutter: bool,
+    broken: bool,
 }
 
 fn parse(a: &[String]) -> Result<Args, String> {
@@ -65,6 +72,8 @@ fn parse(a: &[String]) -> Result<Args, String> {
         csv: false,
         out: None,
         report: false,
+        clutter: false,
+        broken: false,
     };
     let mut it = a.iter();
     while let Some(x) = it.next() {
@@ -83,6 +92,8 @@ fn parse(a: &[String]) -> Result<Args, String> {
             "--format" => r.csv = val()? == "csv",
             "--out" => r.out = Some(val()?.into()),
             "--report" => r.report = true,
+            "--clutter" => r.clutter = true,
+            "--broken" => r.broken = true,
             s if s.starts_with("--") => return Err(format!("unknown option {s}\n{USAGE}")),
             p => r.opts.roots.push(std::fs::canonicalize(p).map_err(|e| format!("{p}: {e}"))?),
         }
@@ -100,16 +111,26 @@ fn scan(a: &[String]) -> Result<(), String> {
     let t = std::time::Instant::now();
     let files = collect(&a.opts, &prog);
     cache.prune(&a.opts.roots, &files);
+    let clutter = if a.clutter { crate::junk::find(&a.opts, &prog, a.broken) } else { vec![] };
+    let (scanned, top) = (files.len(), largest(&files, a.largest));
+    let mut groups = find_dups(files, a.crit, a.cross, &prog, &cache);
+    drop_ignored(&mut groups, &Journal::open(data_dir()).settings.ignored);
     let report = Report {
         created: std::time::SystemTime::now(),
         roots: a.opts.roots.clone(),
-        scanned: files.len(),
-        largest: largest(&files, a.largest),
-        groups: find_dups(files, a.crit, a.cross, &prog, &cache),
+        scanned,
+        largest: top,
+        groups,
         secs: t.elapsed().as_secs_f32(),
+        clutter,
     };
     cache.save().map_err(|e| format!("hash cache: {e}"))?;
-    let body = if a.csv { to_csv(&report.groups) } else { serde_json::to_string_pretty(&report).unwrap() };
+    let body = match (a.csv, report.clutter.is_empty()) {
+        (true, true) => to_csv(&report.groups),
+        // Two CSV tables, blank line between: groups, then clutter (different columns).
+        (true, false) => format!("{}\n{}", to_csv(&report.groups), crate::junk::to_csv(&report.clutter)),
+        (false, _) => serde_json::to_string_pretty(&report).unwrap(),
+    };
     let out = a.out.or_else(|| {
         a.report.then(|| {
             let ts = report.created.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -120,7 +141,7 @@ fn scan(a: &[String]) -> Result<(), String> {
         Some(p) => {
             std::fs::create_dir_all(p.parent().unwrap_or(".".as_ref())).map_err(|e| e.to_string())?;
             std::fs::write(&p, body).map_err(|e| format!("{}: {e}", p.display()))?;
-            eprintln!("{} groups, report: {}", report.groups.len(), p.display());
+            eprintln!("{} groups, {} clutter items, report: {}", report.groups.len(), report.clutter.len(), p.display());
         }
         None => println!("{body}"),
     }
@@ -140,7 +161,11 @@ pub fn schedule(freq: &str, args: &[String]) -> Result<String, String> {
         return Err(format!("frequency must be hourly, daily or weekly\n{USAGE}"));
     }
     parse(args)?; // validate now, not at 3am
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Inside an AppImage current_exe() is a temp mount that vanishes on exit; $APPIMAGE is the real file.
+    let exe = match std::env::var_os("APPIMAGE") {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe().map_err(|e| e.to_string())?,
+    };
     let mut cmd = vec![exe.to_string_lossy().into_owned(), "scan".into(), "--report".into()];
     cmd.extend(args.iter().cloned());
     // A newline would end the ExecStart= line and start a new unit directive (or crontab entry).
@@ -215,7 +240,7 @@ fn sh(cmd: &str, args: &[&str]) -> Result<(), String> {
 }
 
 /// GUI → CLI args for scheduling the scan currently configured.
-pub fn to_args(o: &ScanOpts, c: Criteria, cross: bool) -> Vec<String> {
+pub fn to_args(o: &ScanOpts, c: Criteria, cross: bool, clutter: bool, broken: bool) -> Vec<String> {
     let m: Vec<&str> = [(c.name, "name"), (c.size, "size"), (c.mtime, "mtime"), (c.content, "content")].iter().filter(|x| x.0).map(|x| x.1).collect();
     let mut a = vec!["--match".into(), m.join(","), "--min-size".into(), o.min_size.to_string()];
     for e in o.exclude.iter().filter(|e| !e.is_empty()) {
@@ -227,6 +252,12 @@ pub fn to_args(o: &ScanOpts, c: Criteria, cross: bool) -> Vec<String> {
     }
     if cross {
         a.push("--cross".into());
+    }
+    if clutter {
+        a.push("--clutter".into());
+        if broken {
+            a.push("--broken".into());
+        }
     }
     a.extend(o.roots.iter().map(|r| r.to_string_lossy().into_owned()));
     a
@@ -240,7 +271,7 @@ mod tests {
     fn args_roundtrip() {
         let o = ScanOpts { roots: vec![std::env::temp_dir()], min_size: 5, exclude: vec!["node_modules".into(), "".into()], follow_hidden: true };
         let c = Criteria { name: true, size: false, mtime: false, content: true };
-        let a = parse(&to_args(&o, c, true)).unwrap();
+        let a = parse(&to_args(&o, c, true, true, true)).unwrap();
         assert_eq!(a.crit, c);
         assert_eq!((a.opts.min_size, a.opts.exclude.len(), a.opts.follow_hidden, a.cross), (5, 1, true, true));
         assert!(parse(&["--bogus".into()]).is_err());

@@ -1,6 +1,6 @@
 [package]
 name = "tidytwin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -18,3 +18,13 @@ serde_json = "1.0.154"
 similar = "3.2.1"
 trash = "5.4.0"
 walkdir = "2.5.0"
+
+[package.metadata.deb]
+maintainer = "Federico Agostini"
+copyright = "Federico Agostini"
+extended-description = "Duplicate file finder with GUI and CLI."
+assets = [
+    ["target/release/tidytwin", "usr/bin/", "755"],
+    ["packaging/tidytwin.desktop", "usr/share/applications/", "644"],
+    ["packaging/tidytwin.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TidyTwin
+Comment=Find and clean up duplicate files
+Exec=tidytwin
+Icon=tidytwin
+Terminal=false
+Categories=Utility;FileTools;
+StartupWMClass=tidytwin

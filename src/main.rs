@@ -1,4 +1,5 @@
 mod cli;
+mod junk;
 mod media;
 mod merge;
 mod scan;
@@ -22,7 +23,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "TidyTwin",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_icon(app_icon()),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_icon(app_icon()).with_app_id("tidytwin"),
             ..Default::default()
         },
         Box::new(|cc| {
@@ -151,6 +152,7 @@ enum Tab {
     Folders,
     Images,
     Audio,
+    Clutter,
     Largest,
     Sync,
     Merge,
@@ -164,6 +166,11 @@ struct ScanResult {
     dirs: Vec<Group>,
     images: Vec<Group>,
     audio: Vec<Group>,
+    /// One group per clutter kind found; `junk_kind[i]` labels `junk[i]`.
+    junk: Vec<Group>,
+    junk_kind: Vec<junk::Kind>,
+    /// Reason a clutter item was flagged (link target, decoder error).
+    why: HashMap<(junk::Kind, PathBuf), String>,
     largest: Vec<FileEntry>,
     tree: Option<tree::Tree>,
     sync: Vec<sync::Row>,
@@ -192,6 +199,8 @@ struct App {
     img_dist: u32,
     find_audio: bool,
     audio_tol: u64,
+    find_junk: bool,
+    find_corrupt: bool,
     sched_freq: &'static str,
     tab: Tab,
     running: Option<(Arc<Progress>, mpsc::Receiver<ScanResult>)>,
@@ -250,6 +259,8 @@ impl Default for App {
             img_dist: 6,
             find_audio: false,
             audio_tol: 3,
+            find_junk: true,
+            find_corrupt: false,
             sched_freq: "daily",
             tab: Tab::Dups,
             running: None,
@@ -299,12 +310,20 @@ impl App {
         let opts = self.scan_opts();
         let (crit, two, top_n) = (self.crit, self.mode == Mode::TwoDirs, self.top_n);
         let (fd, fi, fa, dist, tol) = (self.find_dirs, self.find_images, self.find_audio, self.img_dist, self.audio_tol);
+        let (fj, fc) = (self.find_junk, self.find_corrupt);
+        let ignored = self.journal.settings.ignored.clone();
         let prog = Arc::new(Progress::default());
         let (p, cache) = (prog.clone(), self.cache.clone());
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let t = std::time::Instant::now();
             let files = collect(&opts, &p);
+            let clutter = if fj && !p.cancel.load(Ordering::Relaxed) {
+                p.set_phase(5);
+                junk::find(&opts, &p, fc)
+            } else {
+                vec![]
+            };
             let roots = opts.roots;
             if !p.cancel.load(Ordering::Relaxed) {
                 cache.prune(&roots, &files);
@@ -328,8 +347,12 @@ impl App {
                 p.set_phase(3);
                 r.audio = media::similar_audio(&files, tol, &p);
             }
+            (r.junk, r.junk_kind, r.why) = junk::group(clutter);
             p.set_phase(4);
             r.groups = find_dups(files, crit, two, &p, &cache);
+            for list in [&mut r.groups, &mut r.dirs, &mut r.images, &mut r.audio] {
+                drop_ignored(list, &ignored);
+            }
             r.roots = roots;
             r.secs = t.elapsed().as_secs_f32();
             let _ = cache.save();
@@ -596,11 +619,27 @@ impl App {
             ui.add(egui::DragValue::new(&mut self.audio_tol).range(0..=30)).on_hover_text("Allowed duration difference in seconds");
         });
         ui.horizontal(|ui| {
+            ui.checkbox(&mut self.find_junk, "Clutter")
+                .on_hover_text("Empty folders and files, temporary files, broken symlinks, rebuildable build/cache folders, misnamed images, problem file names");
+            ui.add_enabled(self.find_junk, egui::Checkbox::new(&mut self.find_corrupt, "+ broken images & music"))
+                .on_hover_text("Try to open every image and music file to find unreadable ones; slow on big libraries");
+        });
+        ui.horizontal(|ui| {
             ui.label("Min size KiB");
             ui.add(egui::DragValue::new(&mut self.min_kib)).on_hover_text("Ignore files smaller than this");
             ui.label("Largest: top");
             ui.add(egui::DragValue::new(&mut self.top_n).range(1..=100_000)).on_hover_text("How many files to list in Disk usage → Largest files");
         });
+        let n = self.journal.settings.ignored.len();
+        if n > 0 {
+            ui.horizontal(|ui| {
+                ui.label(format!("{n} ignored groups"));
+                if ui.small_button("Show again").on_hover_text("Forget all ignored groups; they reappear on the next scan").clicked() {
+                    self.journal.settings.ignored.clear();
+                    self.save_settings();
+                }
+            });
+        }
     }
 
     fn sidebar_schedule(&mut self, ui: &mut egui::Ui, ready: bool) {
@@ -620,7 +659,7 @@ impl App {
                 .on_hover_text("Run this scan periodically in the background; open results with Load report")
                 .clicked()
             {
-                let a = cli::to_args(&self.scan_opts(), self.crit, self.mode == Mode::TwoDirs);
+                let a = cli::to_args(&self.scan_opts(), self.crit, self.mode == Mode::TwoDirs, self.find_junk, self.find_corrupt);
                 self.log.push(cli::schedule(self.sched_freq, &a).unwrap_or_else(|e| e));
             }
             if ui.small_button("Unschedule").on_hover_text("Remove the scheduled background scan").clicked() {
@@ -631,8 +670,11 @@ impl App {
             && let Some(p) = rfd::FileDialog::new().set_directory(cli::reports_dir()).add_filter("report", &["json"]).pick_file()
         {
             match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str::<Report>(&s).map_err(|e| e.to_string())) {
-                Ok(r) => {
-                    self.res = Some(ScanResult { roots: r.roots, groups: r.groups, largest: r.largest, scanned: r.scanned, secs: r.secs, ..Default::default() });
+                Ok(mut r) => {
+                    // Reports written before a group was ignored still contain it.
+                    drop_ignored(&mut r.groups, &self.journal.settings.ignored);
+                    let (junk, junk_kind, why) = junk::group(r.clutter);
+                    self.res = Some(ScanResult { roots: r.roots, groups: r.groups, largest: r.largest, scanned: r.scanned, secs: r.secs, junk, junk_kind, why, ..Default::default() });
                     self.tab = Tab::Dups;
                     self.sel.clear();
                 }
@@ -764,6 +806,7 @@ impl App {
             Tab::Folders => &res.dirs,
             Tab::Images => &res.images,
             Tab::Audio => &res.audio,
+            Tab::Clutter => &res.junk,
             _ => &res.groups,
         }
     }
@@ -779,12 +822,15 @@ impl App {
                 Tab::Folders => ("📁", "duplicate folders"),
                 Tab::Images => ("🖼", "similar images"),
                 Tab::Audio => ("🎵", "similar music"),
+                Tab::Clutter => ("🗑", "clutter"),
                 _ => ("✔", "duplicates"),
             };
             Self::empty_state(ui, icon, &format!("No {what} found"), "Nothing to clean up here — or enable this search under “What to find”.");
             return;
         }
-        let wasted: u64 = groups.iter().map(|g| g[0].size * (g.len() as u64 - 1)).sum();
+        // Clutter items have no kept copy: all of it is reclaimable.
+        let reclaim = |g: &Group| if tab == Tab::Clutter { g.iter().map(|f| f.size).sum() } else { g[0].size * (g.len() as u64 - 1) };
+        let wasted: u64 = groups.iter().map(reclaim).sum();
         let sel_n = groups.iter().flatten().filter(|f| self.sel.contains(&f.path)).count();
         let sel_bytes: u64 = groups.iter().flatten().filter(|f| self.sel.contains(&f.path)).map(|f| f.size).sum();
         ui.label(format!(
@@ -819,23 +865,35 @@ impl App {
                 .response
                 .on_hover_text("Order of the groups below");
             ui.separator();
-            ui.label("Auto-select, keep:");
-            egui::ComboBox::from_id_salt("keep")
-                .selected_text(format!("{:?}", self.keep))
-                .show_ui(ui, |ui| {
-                    for (k, tip) in [
-                        (KeepRule::Oldest, "Keep the copy with the oldest modified date"),
-                        (KeepRule::Newest, "Keep the copy with the newest modified date"),
-                        (KeepRule::ShortestPath, "Keep the copy with the shortest path"),
-                        (KeepRule::FirstRoot, "Keep the copy in the first scanned folder"),
-                    ] {
-                        ui.selectable_value(&mut self.keep, k, format!("{k:?}")).on_hover_text(tip);
-                    }
-                })
-                .response
-                .on_hover_text("Which copy Apply rule keeps in each group");
-            if ui.button("Apply rule").on_hover_text("In each group, select every copy except the one the rule keeps (protected files are never selected)").clicked() {
-                self.sel.extend(auto_select(groups, self.keep, &self.journal.settings.protected));
+            if tab == Tab::Clutter {
+                if ui
+                    .button("Select junk")
+                    .on_hover_text("Select every empty folder and file, temporary file and broken symlink. Other kinds need a look first. Protected files are never selected.")
+                    .clicked()
+                {
+                    let prot = &self.journal.settings.protected;
+                    let junk = groups.iter().zip(&res.junk_kind).filter(|(_, k)| k.bulk()).flat_map(|(g, _)| g);
+                    self.sel.extend(junk.filter(|f| !is_protected(&f.path, prot)).map(|f| f.path.clone()));
+                }
+            } else {
+                ui.label("Auto-select, keep:");
+                egui::ComboBox::from_id_salt("keep")
+                    .selected_text(format!("{:?}", self.keep))
+                    .show_ui(ui, |ui| {
+                        for (k, tip) in [
+                            (KeepRule::Oldest, "Keep the copy with the oldest modified date"),
+                            (KeepRule::Newest, "Keep the copy with the newest modified date"),
+                            (KeepRule::ShortestPath, "Keep the copy with the shortest path"),
+                            (KeepRule::FirstRoot, "Keep the copy in the first scanned folder"),
+                        ] {
+                            ui.selectable_value(&mut self.keep, k, format!("{k:?}")).on_hover_text(tip);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Which copy Apply rule keeps in each group");
+                if ui.button("Apply rule").on_hover_text("In each group, select every copy except the one the rule keeps (protected files are never selected)").clicked() {
+                    self.sel.extend(auto_select(groups, self.keep, &self.journal.settings.protected));
+                }
             }
             if ui.button("Clear").on_hover_text("Deselect everything").clicked() {
                 self.sel.clear();
@@ -849,7 +907,7 @@ impl App {
         });
         ui.horizontal_wrapped(|ui| {
             ui.strong("Act    ");
-            let actions: &[Action] = if tab == Tab::Folders {
+            let actions: &[Action] = if tab == Tab::Folders || tab == Tab::Clutter {
                 &[Action::Trash, Action::Delete, Action::MoveTo]
             } else {
                 &[Action::Trash, Action::Delete, Action::Hardlink, Action::Reflink, Action::MoveTo]
@@ -904,7 +962,7 @@ impl App {
         ui.separator();
         let f = self.filter.to_lowercase();
         let mut order: Vec<usize> = (0..groups.len()).filter(|&gi| f.is_empty() || groups[gi].iter().any(|x| x.path.to_string_lossy().to_lowercase().contains(&f))).collect();
-        let wasted = |g: &Group| g[0].size * (g.len() as u64 - 1);
+        let wasted = reclaim;
         match self.sort {
             Sort::Wasted => order.sort_by_key(|&i| std::cmp::Reverse(wasted(&groups[i]))),
             Sort::Size => order.sort_by_key(|&i| std::cmp::Reverse(groups[i][0].size)),
@@ -918,7 +976,7 @@ impl App {
                 rows.extend((0..groups[gi].len()).map(|fi| Row::File(gi, fi)));
             }
         }
-        let (mut open, mut protect, mut keep_only) = (None, None, None);
+        let (mut open, mut protect, mut keep_only, mut ignore, mut fix) = (None, None, None, None, false);
         let two = res.roots.len() == 2 && self.mode == Mode::TwoDirs;
         let prot = &self.journal.settings.protected;
         let row_h = if tab == Tab::Images { THUMB + 2.0 } else { ui.spacing().interact_size.y };
@@ -942,7 +1000,12 @@ impl App {
                             let open_now = !self.collapsed.contains(&key);
                             (first, last, fill) = (true, !open_now, head_bg);
                             ui.add_space(8.0);
-                            let head = format!("{}  {} copies × {}", if open_now { "▾" } else { "▸" }, g.len(), human(g[0].size));
+                            let arrow = if open_now { "▾" } else { "▸" };
+                            let head = if tab == Tab::Clutter {
+                                format!("{arrow}  {} · {}", res.junk_kind[gi].label(), g.len())
+                            } else {
+                                format!("{arrow}  {} copies × {}", g.len(), human(g[0].size))
+                            };
                             if ui
                                 .add(egui::Label::new(RichText::new(head).strong()).sense(egui::Sense::click()))
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -954,8 +1017,14 @@ impl App {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add_space(8.0);
                                 egui::Frame::new().fill(pill).corner_radius(10).inner_margin(egui::Margin::symmetric(10, 2)).show(ui, |ui| {
-                                    ui.label(RichText::new(format!("{} wasted", human(wasted(g)))).small().strong().color(Color32::WHITE));
+                                    ui.label(RichText::new(format!("{}{}", human(wasted(g)), if tab == Tab::Clutter { "" } else { " wasted" })).small().strong().color(Color32::WHITE));
                                 });
+                                if tab == Tab::Clutter && res.junk_kind[gi] == junk::Kind::WrongExt {
+                                    fix |= ui.small_button("Fix selected").on_hover_text("Rename the selected files to the extension their content has (undo in History)").clicked();
+                                }
+                                if tab != Tab::Clutter && ui.small_button("ignore").on_hover_text("Hide this group from future scans (it comes back if its files change)").clicked() {
+                                    ignore = Some(gi);
+                                }
                                 if tab == Tab::Dups
                                     && g[0].size < 50 << 20
                                     && is_text(&g[0].path)
@@ -974,7 +1043,7 @@ impl App {
                             if ui.add_enabled(!locked, egui::Checkbox::without_text(&mut on)).changed() {
                                 if on { self.sel.insert(fe.path.clone()) } else { self.sel.remove(&fe.path) };
                             }
-                            if ui.small_button("keep").on_hover_text("Keep this copy, select the others").clicked() {
+                            if tab != Tab::Clutter && ui.small_button("keep").on_hover_text("Keep this copy, select the others").clicked() {
                                 keep_only = Some((gi, fi));
                             }
                             if tab == Tab::Images {
@@ -986,6 +1055,9 @@ impl App {
                             }
                             if locked {
                                 ui.label("🔒").on_hover_text("In a protected folder");
+                            }
+                            if tab == Tab::Clutter && let Some(w) = res.why.get(&(res.junk_kind[gi], fe.path.clone())) {
+                                ui.add_sized([220.0, row_h], egui::Label::new(RichText::new(w).weak()).truncate()).on_hover_text(w);
                             }
                             let r = Self::path_link(ui, &fe.path);
                             if r.clicked() {
@@ -1016,8 +1088,60 @@ impl App {
         if let Some(d) = protect {
             self.protect(d);
         }
+        if let Some(gi) = ignore {
+            self.ignore_group(tab, gi);
+        }
+        if fix {
+            self.fix_extensions();
+        }
         if let Some((l, r)) = open {
             self.open_merge(l, r, None);
+        }
+    }
+
+    fn ignore_group(&mut self, tab: Tab, gi: usize) {
+        let Some(res) = &mut self.res else { return };
+        let list = match tab {
+            Tab::Folders => &mut res.dirs,
+            Tab::Images => &mut res.images,
+            Tab::Audio => &mut res.audio,
+            _ => &mut res.groups,
+        };
+        let g = list.remove(gi);
+        for f in &g {
+            self.sel.remove(&f.path);
+        }
+        // Group indices shifted: fold state keyed by index no longer lines up.
+        self.collapsed.retain(|(t, _)| *t != tab as u8);
+        self.journal.settings.ignored.push(group_key(&g));
+        self.save_settings();
+    }
+
+    /// Rename selected misnamed images to their real extension, as one undoable batch.
+    fn fix_extensions(&mut self) {
+        let Some(res) = &mut self.res else { return };
+        let Some(gi) = res.junk_kind.iter().position(|k| *k == junk::Kind::WrongExt) else { return };
+        let batch = new_batch();
+        let (mut done, mut n_err) = (vec![], 0);
+        for f in res.junk[gi].iter().filter(|f| self.sel.contains(&f.path)) {
+            match junk::fix_ext(&f.path, batch) {
+                Ok(e) => done.push(e),
+                Err(e) => {
+                    n_err += 1;
+                    self.log.push(format!("{}: {e}", f.path.display()));
+                }
+            }
+        }
+        let fixed: HashSet<PathBuf> = done.iter().map(|e| e.orig.clone()).collect();
+        res.junk[gi].retain(|f| !fixed.contains(&f.path));
+        if res.junk[gi].is_empty() {
+            res.junk.remove(gi);
+            res.junk_kind.remove(gi);
+        }
+        self.sel.retain(|p| !fixed.contains(p));
+        self.log.push(format!("Fixed extensions: {} done, {n_err} errors (undo in History)", fixed.len()));
+        if let Err(e) = self.journal.record(done) {
+            self.log.push(format!("JOURNAL WRITE FAILED, undo unavailable: {e}"));
         }
     }
 
@@ -1030,7 +1154,7 @@ impl App {
         let (mut go, mut cancel) = (false, false);
         egui::Window::new("Confirm").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(format!("{eff:?} {n} items?"));
-            if removes_all_copies(groups, &self.sel) {
+            if tab != Tab::Clutter && removes_all_copies(groups, &self.sel) {
                 ui.colored_label(Self::err(ui), "⚠ Some groups have ALL copies selected — those groups will be skipped.");
             }
             if matches!(eff, Action::Hardlink | Action::Reflink) {
@@ -1053,7 +1177,14 @@ impl App {
                 ui.colored_label(Self::warn(ui), "Content not compared: files that differ from the kept copy can't be rebuilt by undo (links refuse them).");
             }
             if eff == Action::Delete {
-                ui.colored_label(Self::err(ui), "Permanent delete: undo only works by re-copying the kept duplicate.");
+                ui.colored_label(
+                    Self::err(ui),
+                    if tab == Tab::Clutter {
+                        "Permanent delete: cannot be undone. Only empty folders are deleted; trash or quarantine build/cache folders."
+                    } else {
+                        "Permanent delete: undo only works by re-copying the kept duplicate."
+                    },
+                );
             }
             ui.horizontal(|ui| {
                 go = ui.button("Proceed").clicked();
@@ -1076,7 +1207,7 @@ impl App {
         if dest.is_none() && matches!(eff, Action::MoveTo) {
             return;
         }
-        let o = ApplyOpts { action: Some(eff), dest, batch, protected: self.journal.settings.protected.clone(), verify_bytes: self.journal.settings.verify_bytes };
+        let o = ApplyOpts { action: Some(eff), dest, batch, protected: self.journal.settings.protected.clone(), verify_bytes: self.journal.settings.verify_bytes, no_keep: tab == Tab::Clutter };
         let (done, errs) = apply(groups, &self.sel, &o);
         self.log.push(format!("{eff:?}: {} done, {} errors (undo in History)", done.len(), errs.len()));
         self.log.extend(errs);
@@ -1093,6 +1224,15 @@ impl App {
                 }
                 list.retain(|g| g.len() > 1);
             }
+            let left: Vec<(Group, junk::Kind)> = std::mem::take(&mut res.junk)
+                .into_iter()
+                .zip(std::mem::take(&mut res.junk_kind))
+                .filter_map(|(mut g, k)| {
+                    g.retain(|f| !gone.iter().any(|x| f.path.starts_with(x)));
+                    (!g.is_empty()).then_some((g, k))
+                })
+                .collect();
+            (res.junk, res.junk_kind) = left.into_iter().unzip();
         }
     }
 
@@ -1665,7 +1805,7 @@ impl eframe::App for App {
                 let (d, t) = (p.hashed.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
                 if t > 0 { format!("TidyTwin — scanning {}%", d * 100 / t) } else { "TidyTwin — scanning…".into() }
             }
-            None => "TidyTwin".into(),
+            None => concat!("TidyTwin ", env!("CARGO_PKG_VERSION")).into(),
         };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1679,6 +1819,7 @@ impl eframe::App for App {
                 (Tab::Folders, format!("📁 Folders{}", count(n(|r| r.dirs.len())))),
                 (Tab::Images, format!("🖼 Images{}", count(n(|r| r.images.len())))),
                 (Tab::Audio, format!("🎵 Music{}", count(n(|r| r.audio.len())))),
+                (Tab::Clutter, format!("🗑 Clutter{}", count(n(|r| r.junk.iter().map(Vec::len).sum())))),
                 (Tab::Largest, "📊 Disk".into()),
                 (Tab::Sync, "⇄ Sync".into()),
                 (Tab::Merge, "📝 Merge".into()),
@@ -1693,6 +1834,7 @@ impl eframe::App for App {
                         Tab::Folders => "Folders with identical contents",
                         Tab::Images => "Visually similar images",
                         Tab::Audio => "Same song in several files",
+                        Tab::Clutter => "Empty folders, temporary files, broken symlinks and broken files",
                         Tab::Largest => "Treemap and largest files",
                         Tab::Sync => "Differences between folders A and B",
                         Tab::Merge => "Compare and merge two text files",
@@ -1712,7 +1854,7 @@ impl eframe::App for App {
             ui.add_space(2.0);
             ui.separator();
             match self.tab {
-                Tab::Dups | Tab::Folders | Tab::Images | Tab::Audio => self.groups_view(ui, self.tab),
+                Tab::Dups | Tab::Folders | Tab::Images | Tab::Audio | Tab::Clutter => self.groups_view(ui, self.tab),
                 Tab::Largest => self.largest_view(ui),
                 Tab::Sync => self.sync_view(ui),
                 Tab::Merge => self.merge_view(ui),

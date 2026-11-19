@@ -83,11 +83,13 @@ pub struct Settings {
     pub protected: Vec<PathBuf>,
     /// Byte-by-byte compare with the kept copy before removing (slower, no hash trust needed).
     pub verify_bytes: bool,
+    /// `group_key`s of duplicate groups hidden from results.
+    pub ignored: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { quarantine: true, retention_days: 30, protected: system_protected(), verify_bytes: false }
+        Self { quarantine: true, retention_days: 30, protected: system_protected(), verify_bytes: false, ignored: vec![] }
     }
 }
 
@@ -325,7 +327,8 @@ fn trash_restore(_: &Path) -> Result<(), String> {
 }
 
 fn undo_entry(e: &Entry) -> Result<(), String> {
-    let stash = e.stash.as_ref().filter(|s| s.exists());
+    // symlink_metadata, not exists(): a stashed broken symlink is still there.
+    let stash = e.stash.as_ref().filter(|s| std::fs::symlink_metadata(s).is_ok());
     let first = match (e.action, stash) {
         (Action::Overwrite, Some(s)) => {
             // Hash = what we wrote; a mismatch means the user edited it since. (Old entries: None, unchecked.)
@@ -346,7 +349,7 @@ fn undo_entry(e: &Entry) -> Result<(), String> {
         }
         (Action::Trash, None) => trash_restore(&e.orig),
         (Action::Quarantine | Action::MoveTo | Action::Trash, Some(s)) => {
-            if e.orig.exists() {
+            if std::fs::symlink_metadata(&e.orig).is_ok() {
                 return Err("original path is occupied".into());
             }
             std::fs::create_dir_all(e.orig.parent().unwrap()).map_err(|x| x.to_string())?;
