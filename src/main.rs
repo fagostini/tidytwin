@@ -22,7 +22,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "TidyTwin",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_icon(app_icon()),
             ..Default::default()
         },
         Box::new(|cc| {
@@ -56,7 +56,48 @@ fn setup_style(ctx: &egui::Context) {
         s.spacing.interact_size.y = 26.0;
         s.spacing.icon_width = 18.0; // checkbox / radio box, scaled with the text
         s.spacing.icon_width_inner = 10.0;
+        // One corner radius everywhere; windows/menus a bit rounder.
+        let v = &mut s.visuals;
+        for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+            w.corner_radius = RADIUS.into();
+        }
+        v.window_corner_radius = 10.into();
+        v.menu_corner_radius = 8.into();
+        v.selection.bg_fill = accent(v.dark_mode);
+        v.selection.stroke.color = Color32::WHITE;
+        v.hyperlink_color = if v.dark_mode { Color32::from_rgb(0x5f, 0xd4, 0xa8) } else { Color32::from_rgb(0x0b, 0x6e, 0x50) };
     });
+}
+
+const RADIUS: u8 = 6;
+
+/// Brand accent (teal): selection, primary button, progress, highlights.
+fn accent(dark: bool) -> Color32 {
+    if dark { Color32::from_rgb(0x14, 0x87, 0x6a) } else { Color32::from_rgb(0x10, 0x7a, 0x5e) }
+}
+
+/// Window icon drawn in code: two overlapping rounded squares ("twins").
+fn app_icon() -> egui::IconData {
+    const N: usize = 64;
+    let mut rgba = vec![0u8; N * N * 4];
+    // (x0, y0, size, rgb)
+    let squares = [(6.0, 6.0, 36.0, [0x5f, 0xd4, 0xa8]), (22.0, 22.0, 36.0, [0x14, 0x87, 0x6a])];
+    for y in 0..N {
+        for x in 0..N {
+            for (x0, y0, s, c) in squares {
+                let (r, px, py) = (8.0f32, x as f32 + 0.5, y as f32 + 0.5);
+                // Signed distance to a rounded rectangle, antialiased over 1px.
+                let (cx, cy, h) = (x0 + s / 2.0, y0 + s / 2.0, s / 2.0 - r);
+                let (dx, dy) = (((px - cx).abs() - h).max(0.0), ((py - cy).abs() - h).max(0.0));
+                let a = (r + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    let i = (y * N + x) * 4;
+                    rgba[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], (a * 255.0) as u8]);
+                }
+            }
+        }
+    }
+    egui::IconData { rgba, width: N as u32, height: N as u32 }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -175,6 +216,7 @@ struct App {
     thumbs: HashMap<PathBuf, Option<egui::TextureHandle>>,
     thumb_ch: (mpsc::Sender<(PathBuf, egui::ColorImage)>, mpsc::Receiver<(PathBuf, egui::ColorImage)>),
     log_open: bool,
+    title: String,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -231,6 +273,7 @@ impl Default for App {
             thumbs: HashMap::new(),
             thumb_ch: mpsc::channel(),
             log_open: false,
+            title: String::new(),
         }
     }
 }
@@ -401,17 +444,28 @@ impl App {
         }
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Scan");
-        egui::CollapsingHeader::new("What to find").default_open(true).show(ui, |ui| self.sidebar_what(ui));
-        ui.separator();
+    fn ready(&self) -> bool {
         let any_crit = self.crit.name || self.crit.size || self.crit.mtime || self.crit.content;
-        let ready = any_crit
+        any_crit
             && match self.mode {
                 Mode::System | Mode::Home => true,
                 Mode::Dirs => !self.roots.is_empty(),
                 Mode::TwoDirs => self.roots.len() == 2,
-            };
+            }
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(RichText::new("What to find").strong()).default_open(true).show(ui, |ui| self.sidebar_what(ui));
+        let ready = self.ready();
+        egui::CollapsingHeader::new(RichText::new("Schedule & reports").strong()).show(ui, |ui| self.sidebar_schedule(ui, ready));
+        egui::CollapsingHeader::new(RichText::new("Safety").strong()).show(ui, |ui| self.sidebar_safety(ui));
+    }
+
+    /// Pinned to the bottom of the sidebar: big accent Scan button, or progress while running.
+    fn scan_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        let w = ui.available_width();
         if let Some((p, _)) = &self.running {
             let phase = scan::PHASES[p.phase.load(Ordering::Relaxed) as usize];
             let (done, total) = (p.hashed.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
@@ -419,23 +473,28 @@ impl App {
                 ui.spinner();
                 ui.label(format!("{phase}… {} files found", p.files_seen.load(Ordering::Relaxed)));
             });
-            if total > 0 {
-                ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{done} / {total}")));
-            }
-            if ui.button("Cancel").on_hover_text("Stop the scan; partial results are discarded").clicked() {
+            let bar = if total > 0 {
+                egui::ProgressBar::new(done as f32 / total as f32).text(format!("{done} / {total}"))
+            } else {
+                egui::ProgressBar::new(0.0).animate(true)
+            };
+            ui.add(bar.fill(accent(ui.visuals().dark_mode)).desired_height(22.0));
+            if ui.add_sized([w, 32.0], egui::Button::new("Cancel")).on_hover_text("Stop the scan; partial results are discarded").clicked() {
                 p.cancel.store(true, Ordering::Relaxed);
             }
-        } else if ui
-            .add_enabled(ready, egui::Button::new(RichText::new("🔍 Scan").heading()))
-            .on_hover_text("Scan the folders above with the options below")
-            .on_disabled_hover_text("Pick folders in the top bar and at least one match criterion")
-            .clicked()
-        {
-            self.start_scan();
+        } else {
+            let ready = self.ready();
+            let btn = egui::Button::new(RichText::new("🔍  Scan").size(20.0).strong().color(Color32::WHITE)).fill(accent(ui.visuals().dark_mode));
+            if ui
+                .add_enabled(ready, btn.min_size(egui::vec2(w, 44.0)))
+                .on_hover_text("Scan the folders in the top bar with the options above")
+                .on_disabled_hover_text("Pick folders in the top bar and at least one match criterion")
+                .clicked()
+            {
+                self.start_scan();
+            }
         }
-        ui.separator();
-        egui::CollapsingHeader::new("Schedule & reports").show(ui, |ui| self.sidebar_schedule(ui, ready));
-        egui::CollapsingHeader::new("Safety").show(ui, |ui| self.sidebar_safety(ui));
+        ui.add_space(8.0);
     }
 
     /// Full-width top bar: scan mode, hidden files, theme / folders / excludes.
@@ -611,6 +670,51 @@ impl App {
         ui.label(format!("Hash cache: {} files", self.cache.len()));
     }
 
+    /// Fixed-width date and right-aligned size columns, so rows line up.
+    fn meta_cols(ui: &mut egui::Ui, fe: &FileEntry, h: f32) {
+        let weak = ui.visuals().weak_text_color();
+        ui.add_sized([130.0, h], egui::Label::new(RichText::new(chrono_lite::Dt::from(fe.mtime).to_string()).monospace().color(weak)));
+        ui.allocate_ui_with_layout(egui::vec2(80.0, h), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_width(80.0);
+            ui.label(RichText::new(human(fe.size)).monospace());
+        });
+        ui.add_space(6.0);
+    }
+
+    /// Path as dimmed folder + bold file name; clickable. Hover shows the full path.
+    fn path_link(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let (weak, strong) = (ui.visuals().weak_text_color(), ui.visuals().strong_text_color());
+        let mut job = egui::text::LayoutJob::default();
+        if let Some(dir) = path.parent() {
+            let sep = std::path::MAIN_SEPARATOR;
+            job.append(&format!("{}{sep}", dir.display()), 0.0, egui::TextFormat::simple(font.clone(), weak));
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        job.append(&name, 0.0, egui::TextFormat::simple(font, strong));
+        ui.add(egui::Label::new(job).sense(egui::Sense::click()).truncate())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("{}\nClick: open containing folder · right-click for more", path.display()))
+    }
+
+    /// Alternate-row stripe behind a row of a plain list.
+    fn stripe(ui: &egui::Ui, idx: egui::layers::ShapeIdx, rect: egui::Rect, i: usize) {
+        if i % 2 == 1 {
+            ui.painter().set(idx, egui::Shape::rect_filled(rect.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y / 2.0)), 0.0, ui.visuals().faint_bg_color));
+        }
+    }
+
+    /// Centered big icon + title + hint for views with nothing to show yet.
+    fn empty_state(ui: &mut egui::Ui, icon: &str, title: &str, hint: &str) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.3).max(20.0));
+            ui.label(RichText::new(icon).size(56.0).weak());
+            ui.add_space(8.0);
+            ui.label(RichText::new(title).size(20.0).strong());
+            ui.label(RichText::new(hint).weak());
+        });
+    }
+
     /// Bottom status bar: last log line, expandable to the full log.
     fn log_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -621,11 +725,30 @@ impl App {
             if ui.small_button("clear").on_hover_text("Clear the log").clicked() {
                 self.log.clear();
             }
-            if !self.log_open
-                && let Some(l) = self.log.last()
-            {
-                ui.add(egui::Label::new(RichText::new(l).small()).truncate());
-            }
+            // Right side: scan summary. Laid out before the log line so truncation eats the log, not the summary.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(res) = &self.res {
+                    let g = Self::groups_of(res, self.tab);
+                    let wasted: u64 = g.iter().map(|g| g[0].size * (g.len() as u64 - 1)).sum();
+                    let sel: Vec<&FileEntry> = g.iter().flatten().filter(|f| self.sel.contains(&f.path)).collect();
+                    ui.label(RichText::new(format!(
+                        "{} files · {} reclaimable · {} selected ({})",
+                        res.scanned,
+                        human(wasted),
+                        sel.len(),
+                        human(sel.iter().map(|f| f.size).sum())
+                    ))
+                    .small()
+                    .strong());
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if !self.log_open
+                        && let Some(l) = self.log.last()
+                    {
+                        ui.add(egui::Label::new(RichText::new(l).small().weak()).truncate());
+                    }
+                });
+            });
         });
         if self.log_open {
             egui::ScrollArea::vertical().id_salt("log").max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
@@ -647,10 +770,20 @@ impl App {
 
     fn groups_view(&mut self, ui: &mut egui::Ui, tab: Tab) {
         let Some(res) = &self.res else {
-            ui.label("Run a scan.");
+            Self::empty_state(ui, "🔍", "No scan yet", "Pick what to scan in the top bar, then press Scan.");
             return;
         };
         let groups = Self::groups_of(res, tab);
+        if groups.is_empty() {
+            let (icon, what) = match tab {
+                Tab::Folders => ("📁", "duplicate folders"),
+                Tab::Images => ("🖼", "similar images"),
+                Tab::Audio => ("🎵", "similar music"),
+                _ => ("✔", "duplicates"),
+            };
+            Self::empty_state(ui, icon, &format!("No {what} found"), "Nothing to clean up here — or enable this search under “What to find”.");
+            return;
+        }
         let wasted: u64 = groups.iter().map(|g| g[0].size * (g.len() as u64 - 1)).sum();
         let sel_n = groups.iter().flatten().filter(|f| self.sel.contains(&f.path)).count();
         let sel_bytes: u64 = groups.iter().flatten().filter(|f| self.sel.contains(&f.path)).map(|f| f.size).sum();
@@ -789,26 +922,53 @@ impl App {
         let two = res.roots.len() == 2 && self.mode == Mode::TwoDirs;
         let prot = &self.journal.settings.protected;
         let row_h = if tab == Tab::Images { THUMB + 2.0 } else { ui.spacing().interact_size.y };
+        // Gap between cards = item spacing; rows inside a card bridge it with their background.
+        const GAP: f32 = 12.0;
+        ui.spacing_mut().item_spacing.y = GAP;
+        let (head_bg, card_bg) = (ui.visuals().widgets.noninteractive.weak_bg_fill, ui.visuals().faint_bg_color);
+        let pill = accent(ui.visuals().dark_mode);
         egui::ScrollArea::vertical().id_salt(("groups", tab as u8)).auto_shrink(false).show_rows(ui, row_h, rows.len(), |ui, range| {
+            let full_x = ui.max_rect().x_range();
             for row in &rows[range] {
-                ui.horizontal(|ui| {
+                let bg = ui.painter().add(egui::Shape::Noop);
+                // (first row of card, last row of card, fill)
+                let (mut first, mut last, mut fill) = (false, false, card_bg);
+                let r = ui.horizontal(|ui| {
                     ui.set_min_height(row_h);
                     match *row {
                         Row::Head(gi) => {
                             let g = &groups[gi];
                             let key = (tab as u8, gi);
                             let open_now = !self.collapsed.contains(&key);
-                            let head = format!("{} {} × {} — {} wasted", if open_now { "▾" } else { "▸" }, g.len(), human(g[0].size), human(wasted(g)));
-                            if ui.selectable_label(false, RichText::new(head).strong()).on_hover_text("Click to fold or unfold this group").clicked() {
+                            (first, last, fill) = (true, !open_now, head_bg);
+                            ui.add_space(8.0);
+                            let head = format!("{}  {} copies × {}", if open_now { "▾" } else { "▸" }, g.len(), human(g[0].size));
+                            if ui
+                                .add(egui::Label::new(RichText::new(head).strong()).sense(egui::Sense::click()))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Click to fold or unfold this group")
+                                .clicked()
+                            {
                                 if open_now { self.collapsed.insert(key) } else { self.collapsed.remove(&key) };
                             }
-                            if tab == Tab::Dups && g[0].size < 50 << 20 && is_text(&g[0].path) && ui.small_button("Compare / merge first two").on_hover_text("Open the first two files in the Text compare / merge tab").clicked() {
-                                open = Some((g[0].path.clone(), g[1].path.clone()));
-                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(8.0);
+                                egui::Frame::new().fill(pill).corner_radius(10).inner_margin(egui::Margin::symmetric(10, 2)).show(ui, |ui| {
+                                    ui.label(RichText::new(format!("{} wasted", human(wasted(g)))).small().strong().color(Color32::WHITE));
+                                });
+                                if tab == Tab::Dups
+                                    && g[0].size < 50 << 20
+                                    && is_text(&g[0].path)
+                                    && ui.small_button("Compare / merge").on_hover_text("Open the first two files in the Text compare / merge tab").clicked()
+                                {
+                                    open = Some((g[0].path.clone(), g[1].path.clone()));
+                                }
+                            });
                         }
                         Row::File(gi, fi) => {
                             let fe = &groups[gi][fi];
-                            ui.add_space(16.0);
+                            last = fi + 1 == groups[gi].len();
+                            ui.add_space(12.0);
                             let locked = is_protected(&fe.path, prot);
                             let mut on = self.sel.contains(&fe.path);
                             if ui.add_enabled(!locked, egui::Checkbox::without_text(&mut on)).changed() {
@@ -820,14 +980,14 @@ impl App {
                             if tab == Tab::Images {
                                 Self::thumb(&mut self.thumbs, &self.thumb_ch.0, ui, &fe.path);
                             }
-                            let mut txt = format!("{}  {}  {}", chrono_lite::Dt::from(fe.mtime), human(fe.size), fe.path.display());
+                            Self::meta_cols(ui, fe, row_h);
                             if two {
-                                txt = format!("[{}] {txt}", ["A", "B"][fe.root.min(1)]);
+                                ui.label(RichText::new(["A", "B"][fe.root.min(1)]).strong());
                             }
                             if locked {
-                                txt = format!("🔒 {txt}");
+                                ui.label("🔒").on_hover_text("In a protected folder");
                             }
-                            let r = ui.link(txt).on_hover_text("Open containing folder · right-click for more");
+                            let r = Self::path_link(ui, &fe.path);
                             if r.clicked() {
                                 let _ = open::that(fe.path.parent().unwrap_or(&fe.path));
                             }
@@ -837,6 +997,11 @@ impl App {
                         }
                     }
                 });
+                let (top, bot) = (if first { 0.0 } else { GAP / 2.0 }, if last { 0.0 } else { GAP / 2.0 });
+                let rect = egui::Rect::from_x_y_ranges(full_x, r.response.rect.min.y - top - 2.0 * first as u8 as f32..=r.response.rect.max.y + bot + 2.0 * last as u8 as f32);
+                let rad = RADIUS + 2;
+                let cr = egui::CornerRadius { nw: rad * first as u8, ne: rad * first as u8, sw: rad * last as u8, se: rad * last as u8 };
+                ui.painter().set(bg, egui::Shape::rect_filled(rect, cr, fill));
             }
         });
         if let Some((gi, fi)) = keep_only {
@@ -942,6 +1107,10 @@ impl App {
         let mut batches: Vec<u64> = self.journal.entries.iter().map(|e| e.batch).collect();
         batches.sort_unstable_by(|a, b| b.cmp(a));
         batches.dedup();
+        if batches.is_empty() {
+            Self::empty_state(ui, "↶", "Nothing to undo", "Actions you run on files appear here and can be undone.");
+            return;
+        }
         let mut undo = None;
         egui::ScrollArea::vertical().id_salt("hist").show(ui, |ui| {
             for b in batches {
@@ -1007,7 +1176,7 @@ impl App {
 
     fn largest_view(&mut self, ui: &mut egui::Ui) {
         let Some(res) = &self.res else {
-            ui.label("Run a scan.");
+            Self::empty_state(ui, "📊", "No scan yet", "Scan a folder to see what takes up space.");
             return;
         };
         ui.horizontal(|ui| {
@@ -1030,14 +1199,16 @@ impl App {
         let (mut trashed, mut protect) = (vec![], None);
         let row_h = ui.spacing().interact_size.y;
         egui::ScrollArea::vertical().id_salt("largest").auto_shrink(false).show_rows(ui, row_h, res.largest.len(), |ui, range| {
-            for f in &res.largest[range] {
-                ui.horizontal(|ui| {
+            let full_x = ui.max_rect().x_range();
+            for (i, f) in res.largest[range.clone()].iter().enumerate() {
+                let bg = ui.painter().add(egui::Shape::Noop);
+                let r = ui.horizontal(|ui| {
+                    ui.add_space(4.0);
                     if ui.small_button("🗑 Trash").on_hover_text("Move to the system trash (undo in History)").clicked() {
                         trashed.push(f.clone());
                     }
-                    ui.add_sized([80.0, row_h], egui::Label::new(human(f.size)));
-                    ui.label(chrono_lite::Dt::from(f.mtime).to_string());
-                    let r = ui.link(f.path.display().to_string()).on_hover_text("Open containing folder · right-click for more");
+                    Self::meta_cols(ui, f, row_h);
+                    let r = Self::path_link(ui, &f.path);
                     if r.clicked() {
                         let _ = open::that(f.path.parent().unwrap_or(&f.path));
                     }
@@ -1045,6 +1216,7 @@ impl App {
                         protect = Some(d);
                     }
                 });
+                Self::stripe(ui, bg, egui::Rect::from_x_y_ranges(full_x, r.response.rect.y_range()), range.start + i);
             }
         });
         if let Some(d) = protect {
@@ -1082,11 +1254,11 @@ impl App {
 
     fn sync_view(&mut self, ui: &mut egui::Ui) {
         let Some(res) = &self.res else {
-            ui.label("Run a scan in “Compare two directories” mode.");
+            Self::empty_state(ui, "⇄", "Compare two folders", "Choose “Compare two directories” in the top bar, add folders A and B, then Scan.");
             return;
         };
         if res.sync.is_empty() {
-            ui.label("Sync view needs a “Compare two directories” scan.");
+            Self::empty_state(ui, "⇄", "Compare two folders", "Choose “Compare two directories” in the top bar, add folders A and B, then Scan.");
             return;
         }
         let count = |s: sync::State| res.sync.iter().filter(|r| r.state == s).count();
@@ -1123,9 +1295,12 @@ impl App {
         };
         let (gray, warn) = (ui.visuals().weak_text_color(), Self::warn(ui));
         let row_h = ui.spacing().interact_size.y;
-        egui::ScrollArea::vertical().id_salt("sync").show_rows(ui, row_h, visible.len(), |ui, range| {
-            for r in &visible[range] {
-                ui.horizontal(|ui| {
+        egui::ScrollArea::vertical().id_salt("sync").auto_shrink(false).show_rows(ui, row_h, visible.len(), |ui, range| {
+            let full_x = ui.max_rect().x_range();
+            for (i, r) in visible[range.clone()].iter().enumerate() {
+                let bg = ui.painter().add(egui::Shape::Noop);
+                let row = ui.horizontal(|ui| {
+                    ui.add_space(4.0);
                     let mut on = self.sync_sel.contains(&r.rel);
                     if ui.checkbox(&mut on, "").changed() {
                         if on { self.sync_sel.insert(r.rel.clone()) } else { self.sync_sel.remove(&r.rel) };
@@ -1154,6 +1329,7 @@ impl App {
                         open = Some((a.path.clone(), b.path.clone()));
                     }
                 });
+                Self::stripe(ui, bg, egui::Rect::from_x_y_ranges(full_x, row.response.rect.y_range()), range.start + i);
             }
         });
         if let Some(d) = protect {
@@ -1209,7 +1385,10 @@ impl App {
                 self.open_merge(l, r, Some(b));
             }
         });
-        let Some(ms) = &mut self.merge else { return };
+        let Some(ms) = &mut self.merge else {
+            Self::empty_state(ui, "📝", "Compare two text files", "Use “Pick two text files…”, or “Compare / merge” on a duplicate group.");
+            return;
+        };
         ui.label(format!(
             "L: {}\nR: {}{}\n{} differing hunks, {} conflicts",
             ms.left.display(),
@@ -1344,12 +1523,27 @@ fn treemap_view(ui: &mut egui::Ui, t: &tree::Tree, cur: usize) -> Option<usize> 
         if ui.add_enabled(t.nodes[cur].parent.is_some(), egui::Button::new("⬆ Up")).on_hover_text("Go to the parent folder").clicked() {
             next = t.nodes[cur].parent;
         }
-        ui.label(format!("{} — {}", if cur == 0 { "all roots".into() } else { t.path(cur).display().to_string() }, human(t.nodes[cur].size)));
+        ui.label(RichText::new(format!("{} — {}", if cur == 0 { "all roots".into() } else { t.path(cur).display().to_string() }, human(t.nodes[cur].size))).strong());
         ui.weak("click: zoom into folder · ctrl+click: open in file manager");
+    });
+    let dark = ui.visuals().dark_mode;
+    // Legend: one swatch per file kind, plus folders.
+    ui.horizontal_wrapped(|ui| {
+        let swatch = |ui: &mut egui::Ui, c: Color32, name: &str| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 3.0, c);
+            ui.label(name);
+            ui.add_space(6.0);
+        };
+        for (i, (name, _)) in KINDS.iter().enumerate() {
+            swatch(ui, kind_color(Some(i), dark), name);
+        }
+        swatch(ui, kind_color(None, dark), "Other");
+        swatch(ui, folder_color(0, dark), "Folder");
     });
     let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click());
     let mut hovered = None;
-    draw_level(&painter, t, cur, resp.rect, 0, resp.hover_pos(), &mut hovered);
+    draw_level(&painter, t, cur, resp.rect, 0, resp.hover_pos(), &mut hovered, dark);
     if let Some(k) = hovered {
         let clicked = resp.clicked();
         resp.on_hover_text_at_pointer(format!("{}\n{}", t.path(k).display(), human(t.nodes[k].size)));
@@ -1367,7 +1561,47 @@ fn treemap_view(ui: &mut egui::Ui, t: &tree::Tree, cur: usize) -> Option<usize> 
 
 const TM_DEPTH: usize = 3;
 
-fn draw_level(painter: &egui::Painter, t: &tree::Tree, node: usize, r: egui::Rect, depth: usize, hover: Option<egui::Pos2>, hovered: &mut Option<usize>) {
+/// File kinds for treemap colouring, in fixed palette order.
+const KINDS: [(&str, &[&str]); 6] = [
+    ("Images", &["jpg", "jpeg", "png", "gif", "webp", "heic", "tif", "tiff", "bmp", "raw", "cr2", "nef", "svg"]),
+    ("Video", &["mp4", "mkv", "mov", "avi", "webm", "m4v", "wmv"]),
+    ("Audio", &["mp3", "flac", "ogg", "opus", "m4a", "wav", "aac"]),
+    ("Documents", &["pdf", "doc", "docx", "odt", "xls", "xlsx", "ods", "ppt", "pptx", "txt", "md", "epub"]),
+    ("Code & data", &["rs", "py", "js", "ts", "c", "h", "cpp", "go", "java", "json", "toml", "yaml", "yml", "html", "css", "sql", "db", "sqlite"]),
+    ("Archives", &["zip", "tar", "gz", "xz", "zst", "7z", "rar", "iso", "deb", "rpm", "dmg", "img"]),
+];
+
+fn kind_of(name: &std::ffi::OsStr) -> Option<usize> {
+    let ext = std::path::Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    KINDS.iter().position(|(_, exts)| exts.contains(&ext.as_str()))
+}
+
+/// Categorical palette, validated for CVD separation in each theme (dataviz validate_palette.js).
+fn kind_color(kind: Option<usize>, dark: bool) -> Color32 {
+    const LIGHT: [u32; 6] = [0x2a78d6, 0xeb6834, 0x1baf7a, 0xeda100, 0xe87ba4, 0x6250d6];
+    const DARK: [u32; 6] = [0x3987e5, 0xd95926, 0x199e70, 0xc98500, 0xd55181, 0x9085e9];
+    let hex = match kind {
+        Some(i) => (if dark { DARK } else { LIGHT })[i],
+        None => if dark { 0x6b7280 } else { 0xa3a9b3 },
+    };
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+/// Neutral folder fill, a step darker/lighter per nesting level.
+fn folder_color(depth: usize, dark: bool) -> Color32 {
+    let d = depth as u8 * 10;
+    if dark { Color32::from_gray(0x34 + d) } else { Color32::from_gray(0xe6 - d) }
+}
+
+/// Black or white, whichever reads better on `c`.
+fn ink_on(c: Color32) -> Color32 {
+    let l = |v: u8| (v as f32 / 255.0).powf(2.2);
+    let lum = 0.2126 * l(c.r()) + 0.7152 * l(c.g()) + 0.0722 * l(c.b());
+    if lum > 0.18 { Color32::BLACK } else { Color32::WHITE }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_level(painter: &egui::Painter, t: &tree::Tree, node: usize, r: egui::Rect, depth: usize, hover: Option<egui::Pos2>, hovered: &mut Option<usize>, dark: bool) {
     // ponytail: top 400 children per level; tiny slivers beyond that aren't visible anyway.
     let kids: Vec<usize> = t.nodes[node].children.iter().copied().filter(|&k| t.nodes[k].size > 0).take(400).collect();
     let vals: Vec<f64> = kids.iter().map(|&k| t.nodes[k].size as f64).collect();
@@ -1377,21 +1611,22 @@ fn draw_level(painter: &egui::Painter, t: &tree::Tree, node: usize, r: egui::Rec
             continue;
         }
         let n = &t.nodes[k];
-        let h = n.name.as_encoded_bytes().iter().fold(7u32, |a, &b| a.wrapping_mul(31).wrapping_add(b as u32));
-        let mut col: Color32 = egui::ecolor::Hsva::new((h % 360) as f32 / 360.0, if n.dir { 0.5 } else { 0.15 }, 0.85 - depth as f32 * 0.12, 1.0).into();
+        let col = if n.dir { folder_color(depth, dark) } else { kind_color(kind_of(&n.name), dark) };
         let hit = hover.is_some_and(|p| rr.contains(p));
         if hit {
             *hovered = Some(k); // deeper levels overwrite → innermost wins
-            col = col.gamma_multiply(1.25);
         }
-        painter.rect_filled(rr.shrink(0.5), 2.0, col);
-        let label = |txt: String| {
-            painter.with_clip_rect(rr).text(rr.min + egui::vec2(3.0, 1.0), egui::Align2::LEFT_TOP, txt, egui::FontId::proportional(13.0), Color32::BLACK)
-        };
-        let inner = egui::Rect::from_min_max(rr.min + egui::vec2(3.0, 18.0), rr.max - egui::vec2(3.0, 3.0));
+        // 1px surface gap between tiles; hovered tile gets an outline instead of a colour shift.
+        painter.rect_filled(rr.shrink(1.0), 3.0, col);
+        if hit && !n.dir {
+            painter.rect_stroke(rr.shrink(1.0), 3.0, egui::Stroke::new(2.0, ink_on(col)), egui::StrokeKind::Inside);
+        }
+        let ink = if n.dir { if dark { Color32::from_gray(230) } else { Color32::from_gray(30) } } else { ink_on(col) };
+        let label = |txt: String| painter.with_clip_rect(rr.shrink(1.0)).text(rr.min + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, txt, egui::FontId::proportional(13.0), ink);
+        let inner = egui::Rect::from_min_max(rr.min + egui::vec2(3.0, 20.0), rr.max - egui::vec2(3.0, 3.0));
         if n.dir && depth + 1 < TM_DEPTH && !n.children.is_empty() && inner.width() > 24.0 && inner.height() > 18.0 {
             label(format!("{}/  {}", n.name.to_string_lossy(), human(n.size)));
-            draw_level(painter, t, k, inner, depth + 1, hover, hovered);
+            draw_level(painter, t, k, inner, depth + 1, hover, hovered, dark);
         } else if rr.width() > 50.0 && rr.height() > 32.0 {
             label(format!("{}{}\n{}", n.name.to_string_lossy(), if n.dir { "/" } else { "" }, human(n.size)));
         }
@@ -1420,22 +1655,38 @@ impl eframe::App for App {
         // Added before the side panel so it spans the full window width.
         egui::Panel::top("where").show(ui, |ui| self.where_bar(ui));
         egui::Panel::left("side").default_size(370.0).show(ui, |ui| {
+            // Bottom first so the scrollable options take the remaining height.
+            egui::Panel::bottom("scanbar").show(ui, |ui| self.scan_bar(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
         });
         egui::Panel::bottom("log").show(ui, |ui| self.log_bar(ui));
+        let title = match &self.running {
+            Some((p, _)) => {
+                let (d, t) = (p.hashed.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
+                if t > 0 { format!("TidyTwin — scanning {}%", d * 100 / t) } else { "TidyTwin — scanning…".into() }
+            }
+            None => "TidyTwin".into(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             let n = |f: fn(&ScanResult) -> usize| self.res.as_ref().map(f).unwrap_or(0);
+            let count = |c: usize| if c > 0 { format!(" {c}") } else { String::new() };
             let tabs = [
-                (Tab::Dups, format!("Duplicates ({})", n(|r| r.groups.len()))),
-                (Tab::Folders, format!("Folders ({})", n(|r| r.dirs.len()))),
-                (Tab::Images, format!("Images ({})", n(|r| r.images.len()))),
-                (Tab::Audio, format!("Music ({})", n(|r| r.audio.len()))),
-                (Tab::Largest, "Disk usage".into()),
-                (Tab::Sync, "A ⇄ B sync".into()),
-                (Tab::Merge, "Text compare / merge".into()),
-                (Tab::History, "History / undo".into()),
+                (Tab::Dups, format!("🗐 Duplicates{}", count(n(|r| r.groups.len())))),
+                (Tab::Folders, format!("📁 Folders{}", count(n(|r| r.dirs.len())))),
+                (Tab::Images, format!("🖼 Images{}", count(n(|r| r.images.len())))),
+                (Tab::Audio, format!("🎵 Music{}", count(n(|r| r.audio.len())))),
+                (Tab::Largest, "📊 Disk".into()),
+                (Tab::Sync, "⇄ Sync".into()),
+                (Tab::Merge, "📝 Merge".into()),
+                (Tab::History, "↶ History".into()),
             ];
-            ui.horizontal_wrapped(|ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
                 for (t, label) in tabs {
                     let tip = match t {
                         Tab::Dups => "Groups of duplicate files",
@@ -1447,9 +1698,18 @@ impl eframe::App for App {
                         Tab::Merge => "Compare and merge two text files",
                         Tab::History => "Past actions; undo them here",
                     };
-                    ui.selectable_value(&mut self.tab, t, label).on_hover_text(tip);
+                    let on = self.tab == t;
+                    let txt = RichText::new(label);
+                    let btn = egui::Button::new(if on { txt.color(Color32::WHITE) } else { txt })
+                        .fill(if on { accent(ui.visuals().dark_mode) } else { Color32::TRANSPARENT })
+                        .stroke(egui::Stroke::NONE)
+                        .min_size(egui::vec2(0.0, 32.0));
+                    if ui.add(btn).on_hover_text(tip).clicked() {
+                        self.tab = t;
+                    }
                 }
             });
+            ui.add_space(2.0);
             ui.separator();
             match self.tab {
                 Tab::Dups | Tab::Folders | Tab::Images | Tab::Audio => self.groups_view(ui, self.tab),
