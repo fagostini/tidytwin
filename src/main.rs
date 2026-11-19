@@ -9,7 +9,7 @@ mod undo;
 use eframe::egui::{self, Color32, RichText};
 use merge::{Chunk, Merge, Pick};
 use scan::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::Ordering, mpsc};
 use undo::{Journal, new_batch};
@@ -110,7 +110,29 @@ struct App {
     tm_node: usize,
     sync_show: [bool; 6],
     sync_sel: HashSet<PathBuf>,
+    sort: Sort,
+    collapsed: HashSet<(u8, usize)>,
+    // ponytail: unbounded thumbnail cache; add LRU if memory matters on huge image sets.
+    thumbs: HashMap<PathBuf, Option<egui::TextureHandle>>,
+    thumb_ch: (mpsc::Sender<(PathBuf, egui::ColorImage)>, mpsc::Receiver<(PathBuf, egui::ColorImage)>),
+    log_open: bool,
 }
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Sort {
+    Wasted,
+    Size,
+    Count,
+    Path,
+}
+
+/// One line of the virtualized groups list.
+enum Row {
+    Head(usize),
+    File(usize, usize),
+}
+
+const THUMB: f32 = 72.0;
 
 impl Default for App {
     fn default() -> Self {
@@ -145,6 +167,11 @@ impl Default for App {
             tm_node: 0,
             sync_show: [true, true, false, true, true, true],
             sync_sel: HashSet::new(),
+            sort: Sort::Wasted,
+            collapsed: HashSet::new(),
+            thumbs: HashMap::new(),
+            thumb_ch: mpsc::channel(),
+            log_open: false,
         }
     }
 }
@@ -184,11 +211,21 @@ impl App {
                 tree: Some(tree::Tree::build(&files, &roots)),
                 scanned: files.len(),
                 sync: if two { sync::compare(&files, &roots, crit.content, &cache) } else { vec![] },
-                dirs: if fd { tree::dup_dirs(&files, &roots, &p, &cache) } else { vec![] },
-                images: if fi { media::similar_images(&files, dist, &p) } else { vec![] },
-                audio: if fa { media::similar_audio(&files, tol, &p) } else { vec![] },
                 ..Default::default()
             };
+            if fd {
+                p.set_phase(1);
+                r.dirs = tree::dup_dirs(&files, &roots, &p, &cache);
+            }
+            if fi {
+                p.set_phase(2);
+                r.images = media::similar_images(&files, dist, &p);
+            }
+            if fa {
+                p.set_phase(3);
+                r.audio = media::similar_audio(&files, tol, &p);
+            }
+            p.set_phase(4);
             r.groups = find_dups(files, crit, two, &p, &cache);
             r.roots = roots;
             r.secs = t.elapsed().as_secs_f32();
@@ -199,6 +236,80 @@ impl App {
         self.sel.clear();
         self.sync_sel.clear();
         self.tm_node = 0;
+        self.collapsed.clear();
+        self.thumbs.clear();
+    }
+
+    /// Visible text color for warnings in the current theme.
+    fn warn(ui: &egui::Ui) -> Color32 {
+        ui.visuals().warn_fg_color
+    }
+    fn err(ui: &egui::Ui) -> Color32 {
+        ui.visuals().error_fg_color
+    }
+
+    /// Right-click menu for a file path. Returns a folder the user asked to protect.
+    fn file_menu(resp: &egui::Response, path: &std::path::Path) -> Option<PathBuf> {
+        let mut protect = None;
+        resp.context_menu(|ui| {
+            if ui.button("Open file").clicked() {
+                let _ = open::that(path);
+                ui.close();
+            }
+            if ui.button("Open containing folder").clicked() {
+                let _ = open::that(path.parent().unwrap_or(path));
+                ui.close();
+            }
+            if ui.button("Copy path").clicked() {
+                ui.ctx().copy_text(path.display().to_string());
+                ui.close();
+            }
+            if let Some(dir) = path.parent()
+                && ui.button("🔒 Protect this folder").clicked()
+            {
+                protect = Some(dir.to_path_buf());
+                ui.close();
+            }
+        });
+        protect
+    }
+
+    fn protect(&mut self, dir: PathBuf) {
+        if !self.journal.settings.protected.contains(&dir) {
+            self.log.push(format!("protected {}", dir.display()));
+            self.journal.settings.protected.push(dir);
+            self.save_settings();
+        }
+    }
+
+    /// Thumbnail for an image row; decodes off the UI thread on first request.
+    fn thumb(thumbs: &mut HashMap<PathBuf, Option<egui::TextureHandle>>, tx: &mpsc::Sender<(PathBuf, egui::ColorImage)>, ui: &mut egui::Ui, path: &std::path::Path) {
+        match thumbs.get(path) {
+            Some(Some(t)) => {
+                let s = t.size_vec2();
+                let k = THUMB / s.x.max(s.y);
+                ui.add_sized([THUMB, THUMB], egui::Image::new((t.id(), s * k)));
+            }
+            Some(None) => {
+                ui.add_sized([THUMB, THUMB], egui::Spinner::new());
+            }
+            None => {
+                thumbs.insert(path.to_path_buf(), None);
+                let (tx, p, ctx) = (tx.clone(), path.to_path_buf(), ui.ctx().clone());
+                rayon::spawn(move || {
+                    // Undecodable file → blank 1×1, so it isn't retried every frame.
+                    let img = image::open(&p)
+                        .map(|i| {
+                            let t = i.thumbnail(THUMB as u32 * 2, THUMB as u32 * 2).to_rgba8();
+                            egui::ColorImage::from_rgba_unmultiplied([t.width() as usize, t.height() as usize], t.as_raw())
+                        })
+                        .unwrap_or_else(|_| egui::ColorImage::new([1, 1], vec![Color32::TRANSPARENT]));
+                    let _ = tx.send((p, img));
+                    ctx.request_repaint();
+                });
+                ui.add_sized([THUMB, THUMB], egui::Spinner::new());
+            }
+        }
     }
 
     fn open_merge(&mut self, l: PathBuf, r: PathBuf, base: Option<PathBuf>) {
@@ -231,7 +342,42 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Scan");
+        ui.horizontal(|ui| {
+            ui.heading("Scan");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), egui::widgets::global_theme_preference_buttons);
+        });
+        egui::CollapsingHeader::new("Where").default_open(true).show(ui, |ui| self.sidebar_where(ui));
+        egui::CollapsingHeader::new("What to find").default_open(true).show(ui, |ui| self.sidebar_what(ui));
+        ui.separator();
+        let any_crit = self.crit.name || self.crit.size || self.crit.mtime || self.crit.content;
+        let ready = any_crit
+            && match self.mode {
+                Mode::System => true,
+                Mode::Dirs => !self.roots.is_empty(),
+                Mode::TwoDirs => self.roots.len() == 2,
+            };
+        if let Some((p, _)) = &self.running {
+            let phase = scan::PHASES[p.phase.load(Ordering::Relaxed) as usize];
+            let (done, total) = (p.hashed.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("{phase}… {} files found", p.files_seen.load(Ordering::Relaxed)));
+            });
+            if total > 0 {
+                ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{done} / {total}")));
+            }
+            if ui.button("Cancel").clicked() {
+                p.cancel.store(true, Ordering::Relaxed);
+            }
+        } else if ui.add_enabled(ready, egui::Button::new(RichText::new("🔍 Scan").heading())).clicked() {
+            self.start_scan();
+        }
+        ui.separator();
+        egui::CollapsingHeader::new("Schedule & reports").show(ui, |ui| self.sidebar_schedule(ui, ready));
+        egui::CollapsingHeader::new("Safety").show(ui, |ui| self.sidebar_safety(ui));
+    }
+
+    fn sidebar_where(&mut self, ui: &mut egui::Ui) {
         ui.radio_value(&mut self.mode, Mode::Dirs, "Selected directories");
         ui.radio_value(&mut self.mode, Mode::TwoDirs, "Compare two directories");
         ui.radio_value(&mut self.mode, Mode::System, "Whole system");
@@ -255,10 +401,15 @@ impl App {
                 self.roots.push(p);
             }
             if self.mode == Mode::TwoDirs && self.roots.len() != 2 {
-                ui.colored_label(Color32::YELLOW, "Pick exactly 2 folders (A, B)");
+                ui.colored_label(Self::warn(ui), "Pick exactly 2 folders (A, B)");
             }
         }
-        ui.separator();
+        ui.checkbox(&mut self.hidden, "Include hidden files");
+        ui.label("Exclude (path substrings, ;-separated):");
+        ui.text_edit_multiline(&mut self.exclude);
+    }
+
+    fn sidebar_what(&mut self, ui: &mut egui::Ui) {
         ui.label("Duplicates match on:");
         ui.checkbox(&mut self.crit.name, "Name");
         ui.checkbox(&mut self.crit.size, "Size");
@@ -280,26 +431,9 @@ impl App {
             ui.label("Largest: top");
             ui.add(egui::DragValue::new(&mut self.top_n).range(1..=100_000));
         });
-        ui.checkbox(&mut self.hidden, "Include hidden files");
-        ui.label("Exclude (path substrings, ;-separated):");
-        ui.text_edit_multiline(&mut self.exclude);
-        ui.separator();
-        let any_crit = self.crit.name || self.crit.size || self.crit.mtime || self.crit.content;
-        let ready = any_crit
-            && match self.mode {
-                Mode::System => true,
-                Mode::Dirs => !self.roots.is_empty(),
-                Mode::TwoDirs => self.roots.len() == 2,
-            };
-        if let Some((p, _)) = &self.running {
-            ui.label(format!("Files: {}  hashed: {}", p.files_seen.load(Ordering::Relaxed), p.hashed.load(Ordering::Relaxed)));
-            ui.spinner();
-            if ui.button("Cancel").clicked() {
-                p.cancel.store(true, Ordering::Relaxed);
-            }
-        } else if ui.add_enabled(ready, egui::Button::new(RichText::new("🔍 Scan").heading())).clicked() {
-            self.start_scan();
-        }
+    }
+
+    fn sidebar_schedule(&mut self, ui: &mut egui::Ui, ready: bool) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("freq").selected_text(self.sched_freq).width(70.0).show_ui(ui, |ui| {
                 for f in ["hourly", "daily", "weekly"] {
@@ -330,8 +464,9 @@ impl App {
                 Err(e) => self.log.push(format!("report: {e}")),
             }
         }
-        ui.separator();
-        ui.heading("Safety");
+    }
+
+    fn sidebar_safety(&mut self, ui: &mut egui::Ui) {
         ui.label("Protected folders (never removed):");
         let mut rm = None;
         for (i, r) in self.journal.settings.protected.iter().enumerate() {
@@ -358,14 +493,25 @@ impl App {
             self.save_settings();
         }
         ui.label(format!("Hash cache: {} files", self.cache.len()));
-        if !self.log.is_empty() {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Log");
-                if ui.small_button("clear").clicked() {
-                    self.log.clear();
-                }
-            });
+    }
+
+    /// Bottom status bar: last log line, expandable to the full log.
+    fn log_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let arrow = if self.log_open { "▾ Log" } else { "▸ Log" };
+            if ui.selectable_label(self.log_open, format!("{arrow} ({})", self.log.len())).clicked() {
+                self.log_open = !self.log_open;
+            }
+            if ui.small_button("clear").clicked() {
+                self.log.clear();
+            }
+            if !self.log_open
+                && let Some(l) = self.log.last()
+            {
+                ui.add(egui::Label::new(RichText::new(l).small()).truncate());
+            }
+        });
+        if self.log_open {
             egui::ScrollArea::vertical().id_salt("log").max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
                 for l in &self.log {
                     ui.small(l);
@@ -401,9 +547,19 @@ impl App {
             human(sel_bytes)
         ));
         if tab == Tab::Images || tab == Tab::Audio {
-            ui.colored_label(Color32::YELLOW, "Similar ≠ identical: removed files can't be rebuilt from the kept one. Use Trash or Quarantine.");
+            ui.colored_label(Self::warn(ui), "Similar ≠ identical: removed files can't be rebuilt from the kept one. Use Trash or Quarantine.");
         }
         ui.horizontal_wrapped(|ui| {
+            ui.strong("Select");
+            ui.label("Filter:");
+            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(160.0).hint_text("path contains…"));
+            ui.label("Sort:");
+            egui::ComboBox::from_id_salt("sort").selected_text(format!("{:?}", self.sort)).show_ui(ui, |ui| {
+                for s in [Sort::Wasted, Sort::Size, Sort::Count, Sort::Path] {
+                    ui.selectable_value(&mut self.sort, s, format!("{s:?}"));
+                }
+            });
+            ui.separator();
             ui.label("Auto-select, keep:");
             egui::ComboBox::from_id_salt("keep").selected_text(format!("{:?}", self.keep)).show_ui(ui, |ui| {
                 for k in [KeepRule::Oldest, KeepRule::Newest, KeepRule::ShortestPath, KeepRule::FirstRoot] {
@@ -416,7 +572,15 @@ impl App {
             if ui.button("Clear").clicked() {
                 self.sel.clear();
             }
-            ui.separator();
+            if ui.button("Collapse all").clicked() {
+                self.collapsed.extend((0..groups.len()).map(|gi| (tab as u8, gi)));
+            }
+            if ui.button("Expand all").clicked() {
+                self.collapsed.retain(|(t, _)| *t != tab as u8);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Act    ");
             let actions: &[Action] = if tab == Tab::Folders {
                 &[Action::Trash, Action::Delete, Action::MoveTo]
             } else {
@@ -456,26 +620,58 @@ impl App {
             {
                 self.log.push(format!("csv: {e}"));
             }
-            ui.label("Filter:");
-            ui.text_edit_singleline(&mut self.filter);
         });
         ui.separator();
-        let mut open = None;
         let f = self.filter.to_lowercase();
+        let mut order: Vec<usize> = (0..groups.len()).filter(|&gi| f.is_empty() || groups[gi].iter().any(|x| x.path.to_string_lossy().to_lowercase().contains(&f))).collect();
+        let wasted = |g: &Group| g[0].size * (g.len() as u64 - 1);
+        match self.sort {
+            Sort::Wasted => order.sort_by_key(|&i| std::cmp::Reverse(wasted(&groups[i]))),
+            Sort::Size => order.sort_by_key(|&i| std::cmp::Reverse(groups[i][0].size)),
+            Sort::Count => order.sort_by_key(|&i| std::cmp::Reverse(groups[i].len())),
+            Sort::Path => order.sort_by(|&a, &b| groups[a][0].path.cmp(&groups[b][0].path)),
+        }
+        let mut rows = Vec::with_capacity(order.len() * 3);
+        for gi in order {
+            rows.push(Row::Head(gi));
+            if !self.collapsed.contains(&(tab as u8, gi)) {
+                rows.extend((0..groups[gi].len()).map(|fi| Row::File(gi, fi)));
+            }
+        }
+        let (mut open, mut protect, mut keep_only) = (None, None, None);
         let two = res.roots.len() == 2 && self.mode == Mode::TwoDirs;
         let prot = &self.journal.settings.protected;
-        egui::ScrollArea::vertical().id_salt(("groups", tab as u8)).show(ui, |ui| {
-            // ponytail: render cap; virtualize with show_rows if users need >1000 groups at once.
-            let shown = groups.iter().enumerate().filter(|(_, g)| f.is_empty() || g.iter().any(|x| x.path.to_string_lossy().to_lowercase().contains(&f)));
-            for (gi, g) in shown.take(1000) {
-                let head = format!("{} × {} — {} wasted", g.len(), human(g[0].size), human(g[0].size * (g.len() as u64 - 1)));
-                egui::CollapsingHeader::new(head).id_salt((tab as u8, gi)).default_open(true).show(ui, |ui| {
-                    for fe in g {
-                        ui.horizontal(|ui| {
+        let row_h = if tab == Tab::Images { THUMB + 2.0 } else { ui.spacing().interact_size.y };
+        egui::ScrollArea::vertical().id_salt(("groups", tab as u8)).auto_shrink(false).show_rows(ui, row_h, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(row_h);
+                    match *row {
+                        Row::Head(gi) => {
+                            let g = &groups[gi];
+                            let key = (tab as u8, gi);
+                            let open_now = !self.collapsed.contains(&key);
+                            let head = format!("{} {} × {} — {} wasted", if open_now { "▾" } else { "▸" }, g.len(), human(g[0].size), human(wasted(g)));
+                            if ui.selectable_label(false, RichText::new(head).strong()).clicked() {
+                                if open_now { self.collapsed.insert(key) } else { self.collapsed.remove(&key) };
+                            }
+                            if tab == Tab::Dups && g[0].size < 50 << 20 && is_text(&g[0].path) && ui.small_button("Compare / merge first two").clicked() {
+                                open = Some((g[0].path.clone(), g[1].path.clone()));
+                            }
+                        }
+                        Row::File(gi, fi) => {
+                            let fe = &groups[gi][fi];
+                            ui.add_space(16.0);
                             let locked = is_protected(&fe.path, prot);
                             let mut on = self.sel.contains(&fe.path);
                             if ui.add_enabled(!locked, egui::Checkbox::without_text(&mut on)).changed() {
                                 if on { self.sel.insert(fe.path.clone()) } else { self.sel.remove(&fe.path) };
+                            }
+                            if ui.small_button("keep").on_hover_text("Keep this copy, select the others").clicked() {
+                                keep_only = Some((gi, fi));
+                            }
+                            if tab == Tab::Images {
+                                Self::thumb(&mut self.thumbs, &self.thumb_ch.0, ui, &fe.path);
                             }
                             let mut txt = format!("{}  {}  {}", chrono_lite::Dt::from(fe.mtime), human(fe.size), fe.path.display());
                             if two {
@@ -484,17 +680,30 @@ impl App {
                             if locked {
                                 txt = format!("🔒 {txt}");
                             }
-                            if ui.link(txt).on_hover_text("Open containing folder").clicked() {
+                            let r = ui.link(txt).on_hover_text("Open containing folder · right-click for more");
+                            if r.clicked() {
                                 let _ = open::that(fe.path.parent().unwrap_or(&fe.path));
                             }
-                        });
-                    }
-                    if tab == Tab::Dups && g.len() >= 2 && g[0].size < 50 << 20 && is_text(&g[0].path) && ui.small_button("Compare / merge first two").clicked() {
-                        open = Some((g[0].path.clone(), g[1].path.clone()));
+                            if let Some(d) = Self::file_menu(&r, &fe.path) {
+                                protect = Some(d);
+                            }
+                        }
                     }
                 });
             }
         });
+        if let Some((gi, fi)) = keep_only {
+            for (i, fe) in groups[gi].iter().enumerate() {
+                if i == fi || is_protected(&fe.path, prot) {
+                    self.sel.remove(&fe.path);
+                } else {
+                    self.sel.insert(fe.path.clone());
+                }
+            }
+        }
+        if let Some(d) = protect {
+            self.protect(d);
+        }
         if let Some((l, r)) = open {
             self.open_merge(l, r, None);
         }
@@ -510,11 +719,11 @@ impl App {
         egui::Window::new("Confirm").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(format!("{eff:?} {n} items?"));
             if removes_all_copies(groups, &self.sel) {
-                ui.colored_label(Color32::RED, "⚠ Some groups have ALL copies selected — those groups will be skipped.");
+                ui.colored_label(Self::err(ui), "⚠ Some groups have ALL copies selected — those groups will be skipped.");
             }
             if matches!(eff, Action::Hardlink | Action::Reflink) {
                 ui.colored_label(
-                    Color32::YELLOW,
+                    Self::warn(ui),
                     if eff == Action::Hardlink {
                         "Hardlink: replaced files take the kept copy's permissions, owner and modified date."
                     } else {
@@ -524,15 +733,15 @@ impl App {
             }
             if tab == Tab::Folders {
                 ui.colored_label(
-                    Color32::YELLOW,
+                    Self::warn(ui),
                     "Folders were compared only on files the scan saw. Hidden files, files under the min size and excluded paths (.git, node_modules…) were NOT checked and are removed with the folder. Quarantined folders are purged after the retention period.",
                 );
             }
             if tab == Tab::Dups && !self.crit.content {
-                ui.colored_label(Color32::YELLOW, "Content not compared: files that differ from the kept copy can't be rebuilt by undo (links refuse them).");
+                ui.colored_label(Self::warn(ui), "Content not compared: files that differ from the kept copy can't be rebuilt by undo (links refuse them).");
             }
             if eff == Action::Delete {
-                ui.colored_label(Color32::RED, "Permanent delete: undo only works by re-copying the kept duplicate.");
+                ui.colored_label(Self::err(ui), "Permanent delete: undo only works by re-copying the kept duplicate.");
             }
             ui.horizontal(|ui| {
                 go = ui.button("Proceed").clicked();
@@ -634,7 +843,7 @@ impl App {
             return;
         }
         egui::Window::new("Empty quarantine").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.colored_label(Color32::RED, format!("Permanently delete {} of quarantined files and backups?", human(self.journal.quarantine_bytes())));
+            ui.colored_label(Self::err(ui), format!("Permanently delete {} of quarantined files and backups?", human(self.journal.quarantine_bytes())));
             ui.label("Undo will afterwards only work by re-copying kept duplicates.");
             ui.horizontal(|ui| {
                 if ui.button("Delete permanently").clicked() {
@@ -671,22 +880,29 @@ impl App {
             }
             return;
         }
-        let mut trashed = vec![];
-        egui::ScrollArea::vertical().id_salt("largest").show(ui, |ui| {
-            egui::Grid::new("lg").striped(true).show(ui, |ui| {
-                for f in &res.largest {
-                    ui.label(human(f.size));
-                    ui.label(chrono_lite::Dt::from(f.mtime).to_string());
-                    if ui.link(f.path.display().to_string()).clicked() {
-                        let _ = open::that(f.path.parent().unwrap_or(&f.path));
-                    }
+        let (mut trashed, mut protect) = (vec![], None);
+        let row_h = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical().id_salt("largest").auto_shrink(false).show_rows(ui, row_h, res.largest.len(), |ui, range| {
+            for f in &res.largest[range] {
+                ui.horizontal(|ui| {
                     if ui.small_button("🗑 Trash").clicked() {
                         trashed.push(f.clone());
                     }
-                    ui.end_row();
-                }
-            });
+                    ui.add_sized([80.0, row_h], egui::Label::new(human(f.size)));
+                    ui.label(chrono_lite::Dt::from(f.mtime).to_string());
+                    let r = ui.link(f.path.display().to_string()).on_hover_text("Open containing folder · right-click for more");
+                    if r.clicked() {
+                        let _ = open::that(f.path.parent().unwrap_or(&f.path));
+                    }
+                    if let Some(d) = Self::file_menu(&r, &f.path) {
+                        protect = Some(d);
+                    }
+                });
+            }
         });
+        if let Some(d) = protect {
+            self.protect(d);
+        }
         for f in trashed {
             if is_protected(&f.path, &self.journal.settings.protected) {
                 self.log.push(format!("{}: protected", f.path.display()));
@@ -752,8 +968,15 @@ impl App {
         ui.separator();
         let show = self.sync_show;
         let visible: Vec<&sync::Row> = res.sync.iter().filter(|r| show[SYNC_STATES.iter().position(|s| *s == r.state).unwrap()]).collect();
-        let mut open = None;
-        egui::ScrollArea::vertical().id_salt("sync").show_rows(ui, 20.0, visible.len(), |ui, range| {
+        let (mut open, mut protect) = (None, None);
+        let (blue, green) = if ui.visuals().dark_mode {
+            (Color32::LIGHT_BLUE, Color32::LIGHT_GREEN)
+        } else {
+            (Color32::from_rgb(0, 80, 190), Color32::from_rgb(0, 120, 40))
+        };
+        let (gray, warn) = (ui.visuals().weak_text_color(), Self::warn(ui));
+        let row_h = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical().id_salt("sync").show_rows(ui, row_h, visible.len(), |ui, range| {
             for r in &visible[range] {
                 ui.horizontal(|ui| {
                     let mut on = self.sync_sel.contains(&r.rel);
@@ -761,15 +984,20 @@ impl App {
                         if on { self.sync_sel.insert(r.rel.clone()) } else { self.sync_sel.remove(&r.rel) };
                     }
                     let (c, sym) = match r.state {
-                        sync::State::OnlyA => (Color32::LIGHT_BLUE, "A only "),
-                        sync::State::OnlyB => (Color32::LIGHT_GREEN, "B only "),
-                        sync::State::Same => (Color32::GRAY, "same   "),
-                        sync::State::NewerA => (Color32::LIGHT_BLUE, "A newer"),
-                        sync::State::NewerB => (Color32::LIGHT_GREEN, "B newer"),
-                        sync::State::Differ => (Color32::YELLOW, "differ "),
+                        sync::State::OnlyA => (blue, "A only "),
+                        sync::State::OnlyB => (green, "B only "),
+                        sync::State::Same => (gray, "same   "),
+                        sync::State::NewerA => (blue, "A newer"),
+                        sync::State::NewerB => (green, "B newer"),
+                        sync::State::Differ => (warn, "differ "),
                     };
                     ui.colored_label(c, RichText::new(sym).monospace());
-                    ui.label(r.rel.display().to_string());
+                    let lbl = ui.add(egui::Label::new(r.rel.display().to_string()).sense(egui::Sense::click()));
+                    if let Some(fe) = r.a.as_ref().or(r.b.as_ref())
+                        && let Some(d) = Self::file_menu(&lbl, &fe.path)
+                    {
+                        protect = Some(d);
+                    }
                     if let (Some(a), Some(b)) = (&r.a, &r.b)
                         && r.state != sync::State::Same
                         && a.size < 50 << 20
@@ -781,6 +1009,9 @@ impl App {
                 });
             }
         });
+        if let Some(d) = protect {
+            self.protect(d);
+        }
         if let Some((a, b)) = open {
             self.open_merge(a, b, None);
         }
@@ -876,14 +1107,29 @@ impl App {
         ui.separator();
         let h = ui.available_height();
         let three = ms.base.is_some();
+        let (red, green) = if ui.visuals().dark_mode {
+            (Color32::from_rgb(220, 90, 90), Color32::from_rgb(90, 190, 90))
+        } else {
+            (Color32::from_rgb(170, 20, 20), Color32::from_rgb(0, 120, 30))
+        };
+        // Prefix each line with its 1-based number, starting at `from`.
+        let numbered = |lines: &[String], from: usize| lines.iter().enumerate().map(|(i, l)| format!("{:>5} {}", from + i, l.trim_end_matches(['\r', '\n']))).collect::<Vec<_>>().join("\n");
         ui.columns(2, |c| {
             egui::ScrollArea::vertical().id_salt("hunks").max_height(h).show(&mut c[0], |ui| {
+                let (mut ln_l, mut ln_r) = (1, 1);
                 for (i, ch) in ms.m.chunks.iter_mut().enumerate() {
                     match ch {
                         Chunk::Same(l) => {
-                            // Collapse long unchanged runs.
-                            let s = if l.len() > 6 { format!("{}  … {} same lines …\n{}", l[..2].concat(), l.len() - 4, l[l.len() - 2..].concat()) } else { l.concat() };
-                            ui.label(RichText::new(s.trim_end()).monospace().weak());
+                            // Collapse long unchanged runs. Numbers are left-side line numbers.
+                            let n = l.len();
+                            let s = if n > 6 {
+                                format!("{}\n      … {} same lines …\n{}", numbered(&l[..2], ln_l), n - 4, numbered(&l[n - 2..], ln_l + n - 2))
+                            } else {
+                                numbered(l, ln_l)
+                            };
+                            ui.label(RichText::new(s).monospace().weak());
+                            ln_l += n;
+                            ln_r += n;
                         }
                         Chunk::Diff { left, right, base, pick, conflict } => {
                             ui.group(|ui| {
@@ -893,8 +1139,14 @@ impl App {
                                 if let Some(b) = base {
                                     ui.label(RichText::new(format!("base:\n{}", b.concat().trim_end())).monospace().weak());
                                 }
-                                ui.label(RichText::new(left.concat().trim_end()).monospace().color(Color32::from_rgb(220, 90, 90)));
-                                ui.label(RichText::new(right.concat().trim_end()).monospace().color(Color32::from_rgb(90, 190, 90)));
+                                ui.columns(2, |lr| {
+                                    lr[0].small("left");
+                                    lr[0].label(RichText::new(numbered(left, ln_l)).monospace().color(red));
+                                    lr[1].small("right");
+                                    lr[1].label(RichText::new(numbered(right, ln_r)).monospace().color(green));
+                                });
+                                ln_l += left.len();
+                                ln_r += right.len();
                                 ui.horizontal(|ui| {
                                     ui.push_id(i, |ui| {
                                         let mut opts = vec![(Pick::Left, "L"), (Pick::Right, "R"), (Pick::LeftThenRight, "L+R"), (Pick::RightThenLeft, "R+L")];
@@ -1001,11 +1253,16 @@ impl eframe::App for App {
             }
         }
         let ctx = ui.ctx().clone();
+        while let Ok((p, img)) = self.thumb_ch.1.try_recv() {
+            let tex = ctx.load_texture(p.display().to_string(), img, Default::default());
+            self.thumbs.insert(p, Some(tex));
+        }
         self.confirm_dialog(&ctx);
         self.purge_dialog(&ctx);
         egui::Panel::left("side").default_size(330.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.sidebar(ui));
         });
+        egui::Panel::bottom("log").show(ui, |ui| self.log_bar(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             let n = |f: fn(&ScanResult) -> usize| self.res.as_ref().map(f).unwrap_or(0);
             let tabs = [

@@ -86,6 +86,7 @@ impl<'a, T> BkTree<'a, T> {
 /// Group visually similar images. `max_dist` = Hamming distance on a 64-bit gradient hash
 /// (0 = near-identical, ~10 = resized/recompressed/lightly edited).
 pub fn similar_images(files: &[FileEntry], max_dist: u32, prog: &Progress) -> Vec<Group> {
+    prog.begin(files.iter().filter(|f| has_ext(f, IMG_EXT)).count());
     let hasher = image_hasher::HasherConfig::new().hash_size(8, 8).hash_alg(image_hasher::HashAlg::Gradient).to_hasher();
     let hashed: Vec<(FileEntry, image_hasher::ImageHash)> = files
         .par_iter()
@@ -123,6 +124,7 @@ fn norm(s: &str) -> String {
 // ponytail: tag-based like dupeGuru's music mode; acoustic fingerprinting (rusty-chromaprint + symphonia) when untagged libraries matter.
 pub fn similar_audio(files: &[FileEntry], tol_secs: u64, prog: &Progress) -> Vec<Group> {
     use lofty::prelude::*;
+    prog.begin(files.iter().filter(|f| has_ext(f, AUDIO_EXT)).count());
     let tracks: Vec<(FileEntry, Track)> = files
         .par_iter()
         .filter(|f| has_ext(f, AUDIO_EXT))

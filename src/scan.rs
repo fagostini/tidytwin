@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,7 +35,25 @@ impl Default for Criteria {
 pub struct Progress {
     pub files_seen: AtomicUsize,
     pub hashed: AtomicUsize,
+    /// Items the current phase will process (0 = unknown, e.g. while walking).
+    pub total: AtomicUsize,
+    /// Index into `PHASES`.
+    pub phase: AtomicU8,
     pub cancel: AtomicBool,
+}
+
+pub const PHASES: [&str; 5] = ["Walking", "Folders", "Images", "Music", "Hashing"];
+
+impl Progress {
+    pub fn set_phase(&self, i: u8) {
+        self.phase.store(i, Ordering::Relaxed);
+        self.begin(0);
+    }
+    /// Start a counted step of `n` items.
+    pub fn begin(&self, n: usize) {
+        self.hashed.store(0, Ordering::Relaxed);
+        self.total.store(n, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone)]
@@ -257,6 +275,7 @@ where
     K: std::hash::Hash + Eq + Send,
     F: Fn(&T) -> Option<K> + Sync,
 {
+    prog.begin(groups.iter().map(Vec::len).sum());
     groups
         .into_par_iter()
         .flat_map(|g| {
