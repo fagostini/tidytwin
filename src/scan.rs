@@ -165,14 +165,17 @@ const PARTIAL: usize = 16 * 1024;
 fn hash_partial(p: &Path, size: u64) -> std::io::Result<[u8; 32]> {
     let mut f = std::fs::File::open(p)?;
     let mut h = blake3::Hasher::new();
-    let mut buf = vec![0u8; PARTIAL];
-    let n = f.read(&mut buf)?;
-    h.update(&buf[..n]);
+    // read_to_end, not read(): a short read (network FS) would hash only a prefix, and for
+    // small files this hash stands in for the full one.
+    let mut buf = Vec::with_capacity(PARTIAL);
+    (&mut f).take(PARTIAL as u64).read_to_end(&mut buf)?;
+    h.update(&buf);
     // Head + tail catches files with shared headers (media containers, zips).
     if size > (2 * PARTIAL) as u64 {
         f.seek(SeekFrom::End(-(PARTIAL as i64)))?;
-        let n = f.read(&mut buf)?;
-        h.update(&buf[..n]);
+        buf.clear();
+        f.take(PARTIAL as u64).read_to_end(&mut buf)?;
+        h.update(&buf);
     }
     Ok(*h.finalize().as_bytes())
 }

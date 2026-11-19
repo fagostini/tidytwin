@@ -81,6 +81,10 @@ fn parse(a: &[String]) -> Result<Args, String> {
         match x.as_str() {
             "--match" => {
                 let v = val()?;
+                // A typo would leave no criteria, and every file would land in one big "duplicate" group.
+                if v.is_empty() || v.split(',').any(|p| !["name", "size", "mtime", "content"].contains(&p)) {
+                    return Err(format!("--match: expected a comma list of name,size,mtime,content, got {v:?}"));
+                }
                 let has = |s| v.split(',').any(|p| p == s);
                 r.crit = Criteria { name: has("name"), size: has("size"), mtime: has("mtime"), content: has("content") };
             }

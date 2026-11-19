@@ -202,11 +202,15 @@ impl Journal {
     /// Write text to `p`, backing up the old content first so it can be undone.
     pub fn save_text(&mut self, p: &Path, txt: &str) -> Result<(), String> {
         let mut e = self.backup(p, new_batch())?;
-        std::fs::write(p, txt).map_err(|e| e.to_string())?;
-        if let Some(e) = &mut e {
+        let w = std::fs::write(p, txt);
+        // Journal the backup even if the write failed part-way: the file may be truncated now.
+        // No hash then, so undo restores it unchecked.
+        if let Some(e) = e.as_mut().filter(|_| w.is_ok()) {
             e.hash = Some(blake3::hash(txt.as_bytes()).to_hex().to_string());
         }
-        self.record(e.into_iter().collect()).map_err(|e| e.to_string())
+        let r = self.record(e.into_iter().collect()).map_err(|e| e.to_string());
+        w.map_err(|e| e.to_string())?;
+        r
     }
 
     /// Copy `src` to `dst` (sync). Overwrites are backed up; new files are journaled so undo can remove them.
@@ -231,10 +235,19 @@ impl Journal {
             }
         };
         std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::copy(src, dst).map_err(|e| e.to_string())?;
-        // Keep source mtime so the two sides compare equal afterwards.
-        let mt = std::fs::metadata(src).and_then(|m| m.modified()).map_err(|e| e.to_string())?;
-        std::fs::File::options().write(true).open(dst).and_then(|f| f.set_modified(mt)).map_err(|e| e.to_string())?;
+        // Copy to a temp name, then rename: copying in place onto a hardlink of `src` (the scan
+        // hides those) truncates both, and a failed copy would leave `dst` half-written.
+        let tmp = tmp_path(dst);
+        (|| {
+            std::fs::copy(src, &tmp)?;
+            // Keep source mtime so the two sides compare equal afterwards.
+            std::fs::File::options().write(true).open(&tmp)?.set_modified(std::fs::metadata(src)?.modified()?)?;
+            std::fs::rename(&tmp, dst)
+        })()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
         // Undo checks this: it won't delete (Created) or roll back (Overwrite) a file edited since.
         e.hash = Some(hex(hash_full(dst).map_err(|e| e.to_string())?));
         Ok(e)
@@ -276,7 +289,10 @@ impl Journal {
             if let Ok(rd) = std::fs::read_dir(self.dir.join(sub)) {
                 for d in rd.flatten() {
                     let id: u64 = d.file_name().to_string_lossy().parse().unwrap_or(0);
-                    if !self.entries.iter().any(|e| e.batch == id && e.stash.is_some() && !e.undone) {
+                    // A batch the journal doesn't know is in flight (another instance) or lost its
+                    // journal write: those files have no other record, never delete them.
+                    let known = self.entries.iter().any(|e| e.batch == id);
+                    if known && !self.entries.iter().any(|e| e.batch == id && e.stash.is_some() && !e.undone) {
                         let _ = std::fs::remove_dir_all(d.path());
                     }
                 }
@@ -535,6 +551,20 @@ mod tests {
         std::fs::write(d.join("a/f.txt"), "edited later").unwrap();
         assert_eq!(j.undo_batch(b).len(), 1);
         assert_eq!(std::fs::read_to_string(d.join("a/f.txt")).unwrap(), "edited later");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn sync_copy_onto_own_hardlink_keeps_data() {
+        let d = std::env::temp_dir().join(format!("tidytwin-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a"), "precious").unwrap();
+        std::fs::hard_link(d.join("a"), d.join("b")).unwrap();
+        let j = Journal::open(d.join("data"));
+        j.copy_over(&d.join("a"), &d.join("b"), 1).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("a")).unwrap(), "precious");
+        assert_eq!(std::fs::read_to_string(d.join("b")).unwrap(), "precious");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
