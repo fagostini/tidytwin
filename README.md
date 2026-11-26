@@ -31,7 +31,7 @@ Duplicate file finder for Linux with a GUI and a CLI.
 
 ```sh
 cargo deb
-sudo apt install ./target/debian/tidytwin_0.2.0-1_amd64.deb
+sudo apt install ./target/debian/tidytwin_0.3.0-1_amd64.deb
 ```
 
 Needs [cargo-deb](https://github.com/kornelski/cargo-deb) (`cargo install cargo-deb`).
