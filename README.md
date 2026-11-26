@@ -61,6 +61,7 @@ tidytwin schedule hourly|daily|weekly [OPTIONS] PATH...
                                             run the scan periodically
 tidytwin unschedule
 tidytwin undo-last                          undo the most recent action batch
+tidytwin apply REPORT.json [APPLY OPTIONS]  act on a saved report's duplicate groups
 tidytwin --version
 
 options:
@@ -76,7 +77,17 @@ options:
   --clutter        also find empty folders/files, temp files, broken symlinks,
                    rebuildable build/cache folders, misnamed images, bad names
   --broken         with --clutter: also open every image/music file to find broken ones (slow)
+
+apply options:
+  --keep RULE      copy to keep per group: oldest|newest|shortest|first-root (default oldest)
+  --prefer TEXT    keep copies whose path contains TEXT; RULE breaks ties
+  --action A       trash|quarantine|hardlink|reflink (default quarantine; undo with undo-last)
+  --dry-run        list what would be acted on, change nothing
 ```
+
+Scheduled scans with `--report` send a desktop notification (via `notify-send`) when duplicates are found.
+
+GUI shortcuts: Ctrl+R scan, Esc cancel scan, Ctrl+F filter, Ctrl+Z undo last batch (History tab). Drop folders on the window to add them.
 
 Example:
 

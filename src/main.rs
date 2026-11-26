@@ -208,6 +208,7 @@ struct App {
     sel: HashSet<PathBuf>,
     filter: String,
     keep: KeepRule,
+    prefer: String,
     action: Action,
     confirm: Option<Tab>,
     log: Vec<String>,
@@ -268,6 +269,7 @@ impl Default for App {
             sel: HashSet::new(),
             filter: String::new(),
             keep: KeepRule::Oldest,
+            prefer: String::new(),
             action: Action::Delete,
             confirm: None,
             log: vec![],
@@ -502,17 +504,20 @@ impl App {
                 egui::ProgressBar::new(0.0).animate(true)
             };
             ui.add(bar.fill(accent(ui.visuals().dark_mode)).desired_height(22.0));
-            if ui.add_sized([w, 32.0], egui::Button::new("Cancel")).on_hover_text("Stop the scan; partial results are discarded").clicked() {
+            let esc = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if ui.add_sized([w, 32.0], egui::Button::new("Cancel")).on_hover_text("Stop the scan; partial results are discarded (Esc)").clicked() || esc {
                 p.cancel.store(true, Ordering::Relaxed);
             }
         } else {
             let ready = self.ready();
+            let hotkey = ready && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R));
             let btn = egui::Button::new(RichText::new("🔍  Scan").size(20.0).strong().color(Color32::WHITE)).fill(accent(ui.visuals().dark_mode));
             if ui
                 .add_enabled(ready, btn.min_size(egui::vec2(w, 44.0)))
-                .on_hover_text("Scan the folders in the top bar with the options above")
+                .on_hover_text("Scan the folders in the top bar with the options above (Ctrl+R)")
                 .on_disabled_hover_text("Pick folders in the top bar and at least one match criterion")
                 .clicked()
+                || hotkey
             {
                 self.start_scan();
             }
@@ -583,6 +588,11 @@ impl App {
                         && let Some(p) = rfd::FileDialog::new().pick_folder()
                     {
                         self.roots.push(p);
+                    }
+                    for p in ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>()) {
+                        if p.is_dir() && !self.roots.contains(&p) {
+                            self.roots.push(p);
+                        }
                     }
                     if self.mode == Mode::TwoDirs && self.roots.len() != 2 {
                         ui.colored_label(Self::warn(ui), "Pick exactly 2 folders (A, B)");
@@ -847,8 +857,12 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Select");
             ui.label("Filter:");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(160.0).hint_text("path contains…"))
-                .on_hover_text("Show only groups with a file whose path contains this text");
+            let f = ui
+                .add(egui::TextEdit::singleline(&mut self.filter).desired_width(160.0).hint_text("path contains…"))
+                .on_hover_text("Show only groups with a file whose path contains this text (Ctrl+F)");
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                f.request_focus();
+            }
             ui.label("Sort:");
             egui::ComboBox::from_id_salt("sort")
                 .selected_text(format!("{:?}", self.sort))
@@ -891,8 +905,10 @@ impl App {
                     })
                     .response
                     .on_hover_text("Which copy Apply rule keeps in each group");
+                ui.add(egui::TextEdit::singleline(&mut self.prefer).hint_text("prefer path…").desired_width(110.0))
+                    .on_hover_text("Keep copies whose path contains this text (e.g. /Photos/); the rule breaks ties");
                 if ui.button("Apply rule").on_hover_text("In each group, select every copy except the one the rule keeps (protected files are never selected)").clicked() {
-                    self.sel.extend(auto_select(groups, self.keep, &self.journal.settings.protected));
+                    self.sel.extend(auto_select(groups, self.keep, &self.prefer, &self.journal.settings.protected));
                 }
             }
             if ui.button("Clear").on_hover_text("Deselect everything").clicked() {
@@ -1286,6 +1302,12 @@ impl App {
                     });
                 });
             }
+        });
+        // ponytail: Ctrl+Z only on History tab, so the user sees what gets undone.
+        let undo = undo.or_else(|| {
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z))
+                .then(|| self.journal.entries.iter().filter(|e| !e.undone).map(|e| e.batch).max())
+                .flatten()
         });
         if let Some(b) = undo {
             let errs = self.journal.undo_batch(b);
@@ -1787,6 +1809,10 @@ impl eframe::App for App {
         }
         let ctx = ui.ctx().clone();
         while let Ok((p, img)) = self.thumb_ch.1.try_recv() {
+            // ponytail: drop all textures past the cap (visible ones re-decode); true LRU if the flicker shows.
+            if self.thumbs.len() > 1500 {
+                self.thumbs.retain(|_, t| t.is_none());
+            }
             let tex = ctx.load_texture(p.display().to_string(), img, Default::default());
             self.thumbs.insert(p, Some(tex));
         }

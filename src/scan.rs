@@ -382,17 +382,21 @@ pub fn is_protected(p: &Path, protected: &[PathBuf]) -> bool {
 
 /// Mark everything for removal except one file per group chosen by `rule`.
 /// Files under `protected` dirs are never selected; a group containing one keeps it.
-pub fn auto_select(groups: &[Group], rule: KeepRule, protected: &[PathBuf]) -> HashSet<PathBuf> {
+/// Non-empty `prefer`: copies whose path contains it win; `rule` breaks ties (or decides if none match).
+pub fn auto_select(groups: &[Group], rule: KeepRule, prefer: &str, protected: &[PathBuf]) -> HashSet<PathBuf> {
     let mut sel = HashSet::new();
     for g in groups {
+        let hit = |f: &&FileEntry| !prefer.is_empty() && f.path.to_string_lossy().contains(prefer);
+        let pool: Vec<&FileEntry> = if g.iter().any(|f| hit(&f)) { g.iter().filter(hit).collect() } else { g.iter().collect() };
+        let pool = pool.into_iter();
         let keep = if g.iter().any(|f| is_protected(&f.path, protected)) {
             None
         } else {
             match rule {
-                KeepRule::Oldest => g.iter().min_by_key(|f| f.mtime),
-                KeepRule::Newest => g.iter().max_by_key(|f| f.mtime),
-                KeepRule::ShortestPath => g.iter().min_by_key(|f| f.path.as_os_str().len()),
-                KeepRule::FirstRoot => g.iter().min_by_key(|f| f.root),
+                KeepRule::Oldest => pool.min_by_key(|f| f.mtime),
+                KeepRule::Newest => pool.max_by_key(|f| f.mtime),
+                KeepRule::ShortestPath => pool.min_by_key(|f| f.path.as_os_str().len()),
+                KeepRule::FirstRoot => pool.min_by_key(|f| f.root),
             }
         };
         let keep = keep.map(|f| &f.path);
@@ -678,14 +682,17 @@ mod tests {
         // Protected folder: never selected, and apply refuses it.
         let g = find_dups(collect(&opts, &prog), Criteria::default(), true, &prog, &cache);
         let prot = vec![d.join("b")];
-        let sel = auto_select(&g, KeepRule::FirstRoot, &prot);
+        let sel = auto_select(&g, KeepRule::FirstRoot, "", &prot);
         assert_eq!(sel, [d.join("a/x.bin")].into(), "protected b/y kept, a/x selected");
+        // Prefer path beats the rule: FirstRoot alone would keep a/x.
+        assert_eq!(auto_select(&g, KeepRule::FirstRoot, "/b/", &[]), [d.join("a/x.bin")].into());
+        assert_eq!(auto_select(&g, KeepRule::FirstRoot, "/nomatch/", &[]), [d.join("b/y.bin")].into());
         let forced: HashSet<_> = [d.join("b/y.bin")].into();
         let (ok, errs) = apply(&g, &forced, &ApplyOpts { action: Some(Action::Delete), protected: prot, ..Default::default() });
         assert_eq!((ok.len(), errs.len()), (0, 1));
 
         // Hardlink with byte verify.
-        let sel = auto_select(&g, KeepRule::FirstRoot, &[]);
+        let sel = auto_select(&g, KeepRule::FirstRoot, "", &[]);
         assert!(removes_all_copies(&g, &g[0].iter().map(|f| f.path.clone()).collect()));
         let (ok, errs) = apply(&g, &sel, &ApplyOpts { action: Some(Action::Hardlink), verify_bytes: true, ..Default::default() });
         assert_eq!((ok.len(), errs.len()), (1, 0), "{errs:?}");

@@ -12,6 +12,7 @@ usage:
                                              data dir and can be opened in the GUI
   tidytwin unschedule
   tidytwin undo-last                          undo the most recent action batch
+  tidytwin apply REPORT.json [APPLY OPTIONS]  act on a saved report's duplicate groups
   tidytwin --version
 
 options:
@@ -27,7 +28,25 @@ options:
   --clutter        also find empty folders/files, temp files, broken symlinks,
                    rebuildable build/cache folders, misnamed images, bad names
   --broken         with --clutter: also open every image/music file to find broken ones (slow)
+
+apply options:
+  --keep RULE      copy to keep per group: oldest|newest|shortest|first-root (default oldest)
+  --prefer TEXT    keep copies whose path contains TEXT; RULE breaks ties
+  --action A       trash|quarantine|hardlink|reflink (default quarantine; undo with undo-last)
+  --dry-run        list what would be acted on, change nothing
+Protected folders from the GUI settings are never touched.
 ";
+
+#[test]
+fn parse_apply_args() {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let a = parse_apply(&s(&["r.json", "--keep", "newest", "--prefer", "/Photos/", "--action", "hardlink", "--dry-run"])).unwrap();
+    assert_eq!(a, ApplyArgs { report: "r.json".into(), keep: KeepRule::Newest, prefer: "/Photos/".into(), action: Action::Hardlink, dry_run: true });
+    assert_eq!(parse_apply(&s(&["r.json"])).unwrap().action, Action::Quarantine);
+    assert!(parse_apply(&s(&["r.json", "--action", "delete"])).is_err(), "no permanent delete headlessly");
+    assert!(parse_apply(&s(&[])).is_err());
+    assert!(parse_apply(&s(&["a", "b"])).is_err());
+}
 
 pub fn reports_dir() -> PathBuf {
     data_dir().join("reports")
@@ -40,6 +59,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("schedule") => args.get(1).ok_or("missing frequency".to_string()).and_then(|f| schedule(f, &args[2..])).map(|m| println!("{m}")),
         Some("unschedule") => unschedule().map(|m| println!("{m}")),
         Some("undo-last") => undo_last(),
+        Some("apply") => apply_report(&args[1..]),
         _ => Err(USAGE.into()),
     };
     match r {
@@ -146,6 +166,12 @@ fn scan(a: &[String]) -> Result<(), String> {
             std::fs::create_dir_all(p.parent().unwrap_or(".".as_ref())).map_err(|e| e.to_string())?;
             std::fs::write(&p, body).map_err(|e| format!("{}: {e}", p.display()))?;
             eprintln!("{} groups, {} clutter items, report: {}", report.groups.len(), report.clutter.len(), p.display());
+            let wasted: u64 = report.groups.iter().map(|g| g[0].size * (g.len() as u64 - 1)).sum();
+            if a.report && wasted > 0 {
+                // Best effort: no notify-send / no session bus → silently skip.
+                let msg = format!("{} duplicate groups, {} MB reclaimable. Open tidytwin to review.", report.groups.len(), wasted / 1_000_000);
+                let _ = std::process::Command::new("notify-send").args(["-a", "tidytwin", "-i", "tidytwin", "tidytwin scan finished", &msg]).output();
+            }
         }
         None => println!("{body}"),
     }
@@ -156,6 +182,78 @@ fn undo_last() -> Result<(), String> {
     let mut j = Journal::open(data_dir());
     let b = j.entries.iter().filter(|e| !e.undone).map(|e| e.batch).max().ok_or("nothing to undo")?;
     let errs = j.undo_batch(b);
+    if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) }
+}
+
+/// Parsed `apply` arguments.
+#[derive(Debug, PartialEq)]
+struct ApplyArgs {
+    report: PathBuf,
+    keep: KeepRule,
+    prefer: String,
+    action: Action,
+    dry_run: bool,
+}
+
+fn parse_apply(args: &[String]) -> Result<ApplyArgs, String> {
+    let mut a = ApplyArgs { report: PathBuf::new(), keep: KeepRule::Oldest, prefer: String::new(), action: Action::Quarantine, dry_run: false };
+    let mut it = args.iter();
+    while let Some(s) = it.next() {
+        let mut val = || it.next().ok_or(format!("{s} needs a value"));
+        match s.as_str() {
+            "--keep" => {
+                a.keep = match val()?.as_str() {
+                    "oldest" => KeepRule::Oldest,
+                    "newest" => KeepRule::Newest,
+                    "shortest" => KeepRule::ShortestPath,
+                    "first-root" => KeepRule::FirstRoot,
+                    v => return Err(format!("--keep: oldest,newest,shortest,first-root (got {v})")),
+                }
+            }
+            "--prefer" => a.prefer = val()?.clone(),
+            "--action" => {
+                // No permanent delete headlessly: everything here stays undoable.
+                a.action = match val()?.as_str() {
+                    "trash" => Action::Trash,
+                    "quarantine" => Action::Quarantine,
+                    "hardlink" => Action::Hardlink,
+                    "reflink" => Action::Reflink,
+                    v => return Err(format!("--action: trash,quarantine,hardlink,reflink (got {v})")),
+                }
+            }
+            "--dry-run" => a.dry_run = true,
+            s if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            p if a.report.as_os_str().is_empty() => a.report = PathBuf::from(p),
+            p => return Err(format!("unexpected argument {p}")),
+        }
+    }
+    if a.report.as_os_str().is_empty() {
+        return Err("apply: give a JSON report path (from `tidytwin scan --report --format json`)".into());
+    }
+    Ok(a)
+}
+
+/// Act on a saved report's duplicate groups headlessly. Journaled: `tidytwin undo-last` reverts it.
+fn apply_report(args: &[String]) -> Result<(), String> {
+    let a = parse_apply(args)?;
+    let body = std::fs::read_to_string(&a.report).map_err(|e| format!("{}: {e}", a.report.display()))?;
+    let report: Report = serde_json::from_str(&body).map_err(|e| format!("{}: not a JSON report: {e}", a.report.display()))?;
+    let mut j = Journal::open(data_dir());
+    let sel = auto_select(&report.groups, a.keep, &a.prefer, &j.settings.protected);
+    let bytes: u64 = report.groups.iter().flatten().filter(|f| sel.contains(&f.path)).map(|f| f.size).sum();
+    if a.dry_run {
+        let mut v: Vec<_> = sel.iter().collect();
+        v.sort();
+        v.iter().for_each(|p| println!("{}", p.display()));
+        eprintln!("dry run: would {:?} {} files, {} MB", a.action, sel.len(), bytes / 1_000_000);
+        return Ok(());
+    }
+    let batch = crate::undo::new_batch();
+    let dest = (a.action == Action::Quarantine).then(|| j.quarantine_dir(batch));
+    let o = ApplyOpts { action: Some(a.action), dest, batch, protected: j.settings.protected.clone(), verify_bytes: j.settings.verify_bytes, no_keep: false };
+    let (done, errs) = apply(&report.groups, &sel, &o);
+    eprintln!("{:?}: {} done, {} errors (revert with `tidytwin undo-last`)", a.action, done.len(), errs.len());
+    j.record(done).map_err(|e| format!("JOURNAL WRITE FAILED, undo unavailable: {e}"))?;
     if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) }
 }
 
