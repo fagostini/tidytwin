@@ -1022,6 +1022,18 @@ impl App {
                             } else {
                                 format!("{arrow}  {} copies × {}", g.len(), human(g[0].size))
                             };
+                            let n_sel = g.iter().filter(|f| self.sel.contains(&f.path)).count();
+                            let mut all = n_sel == g.len();
+                            let partial = n_sel > 0 && !all;
+                            if ui
+                                .add(egui::Checkbox::without_text(&mut all).indeterminate(partial))
+                                .on_hover_text("Select or deselect every item in this group")
+                                .changed()
+                            {
+                                for f in g.iter() {
+                                    if all { self.sel.insert(f.path.clone()) } else { self.sel.remove(&f.path) };
+                                }
+                            }
                             if ui
                                 .add(egui::Label::new(RichText::new(head).strong()).sense(egui::Sense::click()))
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1167,14 +1179,15 @@ impl App {
         let groups = Self::groups_of(res, tab);
         let eff = self.effective_action(tab);
         let n = groups.iter().flatten().filter(|f| self.sel.contains(&f.path)).count();
-        let (mut go, mut cancel) = (false, false);
-        egui::Window::new("Confirm").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(format!("{eff:?} {n} items?"));
+        let (go, cancel) = Self::modal(ctx, "Confirm action", &format!("{eff:?} {n} items"), eff == Action::Delete, |ui| {
+            ui.label(RichText::new(format!("{eff:?} {n} selected items?")).size(16.0));
+            ui.add_space(4.0);
             if tab != Tab::Clutter && removes_all_copies(groups, &self.sel) {
-                ui.colored_label(Self::err(ui), "⚠ Some groups have ALL copies selected — those groups will be skipped.");
+                Self::note(ui, Self::err(ui), "⚠ Some groups have ALL copies selected — those groups will be skipped.");
             }
             if matches!(eff, Action::Hardlink | Action::Reflink) {
-                ui.colored_label(
+                Self::note(
+                    ui,
                     Self::warn(ui),
                     if eff == Action::Hardlink {
                         "Hardlink: replaced files take the kept copy's permissions, owner and modified date."
@@ -1184,16 +1197,18 @@ impl App {
                 );
             }
             if tab == Tab::Folders {
-                ui.colored_label(
+                Self::note(
+                    ui,
                     Self::warn(ui),
                     "Folders were compared only on files the scan saw. Hidden files, files under the min size and excluded paths (.git, node_modules…) were NOT checked and are removed with the folder. Quarantined folders are purged after the retention period.",
                 );
             }
             if tab == Tab::Dups && !self.crit.content {
-                ui.colored_label(Self::warn(ui), "Content not compared: files that differ from the kept copy can't be rebuilt by undo (links refuse them).");
+                Self::note(ui, Self::warn(ui), "Content not compared: files that differ from the kept copy can't be rebuilt by undo (links refuse them).");
             }
             if eff == Action::Delete {
-                ui.colored_label(
+                Self::note(
+                    ui,
                     Self::err(ui),
                     if tab == Tab::Clutter {
                         "Permanent delete: cannot be undone. Only empty folders are deleted; trash or quarantine build/cache folders."
@@ -1202,10 +1217,6 @@ impl App {
                     },
                 );
             }
-            ui.horizontal(|ui| {
-                go = ui.button("Proceed").clicked();
-                cancel = ui.button("Cancel").clicked();
-            });
         });
         if cancel {
             self.confirm = None;
@@ -1320,20 +1331,51 @@ impl App {
         if !self.confirm_purge {
             return;
         }
-        egui::Window::new("Empty quarantine").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.colored_label(Self::err(ui), format!("Permanently delete {} of quarantined files and backups?", human(self.journal.quarantine_bytes())));
-            ui.label("Undo will afterwards only work by re-copying kept duplicates.");
-            ui.horizontal(|ui| {
-                if ui.button("Delete permanently").clicked() {
-                    let r = self.journal.purge(0);
-                    self.log.push(format!("purge: {r:?}"));
-                    self.confirm_purge = false;
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_purge = false;
-                }
+        let (go, cancel) = Self::modal(ctx, "🗑  Empty quarantine", "Delete permanently", true, |ui| {
+            ui.label(format!("Permanently delete {} of quarantined files and backups?", human(self.journal.quarantine_bytes())));
+            Self::note(ui, Self::err(ui), "Undo will afterwards only work by re-copying kept duplicates.");
+        });
+        if go {
+            let r = self.journal.purge(0);
+            self.log.push(format!("purge: {r:?}"));
+        }
+        if go || cancel {
+            self.confirm_purge = false;
+        }
+    }
+
+    /// Centered modal: dims and blocks the window behind it. Returns (proceed, cancel);
+    /// Esc or a click outside counts as cancel.
+    fn modal(ctx: &egui::Context, title: &str, ok: &str, danger: bool, body: impl FnOnce(&mut egui::Ui)) -> (bool, bool) {
+        let (mut go, mut cancel) = (false, false);
+        let r = egui::Modal::new(egui::Id::unique(title)).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading(title);
+            ui.add_space(6.0);
+            body(ui);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let fill = if danger { Self::err(ui) } else { accent(ui.visuals().dark_mode) };
+                go = ui.add(egui::Button::new(RichText::new(ok).strong().color(Color32::WHITE)).fill(fill).min_size(egui::vec2(110.0, 30.0))).clicked();
+                cancel = ui.add(egui::Button::new("Cancel").min_size(egui::vec2(90.0, 30.0))).clicked();
             });
         });
+        (go, cancel || r.should_close())
+    }
+
+    /// Tinted callout box for warnings inside dialogs.
+    fn note(ui: &mut egui::Ui, color: Color32, text: &str) {
+        egui::Frame::new()
+            .fill(color.gamma_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.colored_label(color, text);
+            });
+        ui.add_space(4.0);
     }
 
     fn largest_view(&mut self, ui: &mut egui::Ui) {
